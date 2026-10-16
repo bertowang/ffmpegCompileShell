@@ -1,0 +1,504 @@
+"""平台/工具链适配：Windows(MSVC) / Android(NDK) / iOS(Xcode)。
+
+新增一个平台：继承 :class:`Toolchain` 并在 :data:`TOOLCHAINS` 中注册。
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import platform as platform_mod
+import re
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from .config import PROJECT_ROOT, TOOLS_DIR
+from .utils import copy_tree, ensure_dir, fix_pkgconfig_prefixes, lipo_create, static_lib_names, to_msys_path, which
+
+VSWHERE_CANDIDATES = [
+    r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+    r"C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe",
+]
+VS_GLOB = [
+    r"C:\Program Files\Microsoft Visual Studio\*",
+    r"C:\Program Files (x86)\Microsoft Visual Studio\*",
+]
+MSYS2_CANDIDATES = [r"C:\msys64", r"C:\msys32", r"C:\tools\msys64"]
+
+
+class ToolchainError(RuntimeError):
+    """工具链缺失或不可用，``hint`` 给出修复方式。"""
+
+    def __init__(self, tool: str, message: str, hint: str = ""):
+        super().__init__(f"[{tool}] {message}" + (f"\n  -> {hint}" if hint else ""))
+        self.tool = tool
+        self.hint = hint
+
+
+# ------------------------------------------------------------------ MSVC
+class MSVC:
+    """一次 ``vcvarsall.bat`` 的环境抓取结果。"""
+
+    def __init__(self, install: Path, vcvarsall: Path, env: Dict[str, str], year: str):
+        self.install = install
+        self.vcvarsall = vcvarsall
+        self.env = env
+        self.year = year
+
+    @property
+    def generator(self) -> Optional[str]:
+        return {"2022": "Visual Studio 17 2022", "2019": "Visual Studio 16 2019"}.get(self.year)
+
+    @classmethod
+    def discover(cls, logger, arch: str = "x64") -> Optional["MSVC"]:
+        install = cls._find_installation()
+        if not install:
+            return None
+        vcvarsall = install / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+        if not vcvarsall.exists():
+            return None
+        env = cls._capture_env(vcvarsall, arch)
+        if not env or not which("cl", env):
+            return None
+        year = next((p for p in install.parts if p in ("2022", "2019", "2017")), "2022")
+        return cls(install, vcvarsall, env, year)
+
+    @staticmethod
+    def _find_installation() -> Optional[Path]:
+        for vswhere in VSWHERE_CANDIDATES:
+            if not Path(vswhere).exists():
+                continue
+            try:
+                proc = subprocess.run(
+                    [vswhere, "-latest", "-products", "*",
+                     "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                     "-property", "installationPath"],
+                    capture_output=True, text=True, errors="replace", timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line and Path(line).exists():
+                    return Path(line)
+        found = [Path(p) for pattern in VS_GLOB for p in glob.glob(pattern)
+                 if (Path(p) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat").exists()]
+        return max(found, key=lambda p: p.name) if found else None
+
+    @staticmethod
+    def _capture_env(vcvarsall: Path, arch: str) -> Dict[str, str]:
+        """必须用 shell 交给 cmd 解析，否则带空格的 .bat 路径无法识别。"""
+        command = f'chcp 65001 >nul && call "{vcvarsall}" {arch} >nul && set'
+        env: Dict[str, str] = {}
+        for encoding in ("utf-8", "mbcs"):
+            try:
+                proc = subprocess.run(command, shell=True, capture_output=True,
+                                      text=True, encoding=encoding, errors="replace", timeout=180)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            env = _normalize_env(_parse_env_block(proc.stdout))
+            if which("cl", env):
+                return env
+        return env
+
+
+def _parse_env_block(text: str) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.rstrip("\r\n").partition("=")
+        if key.strip() and not key.startswith("!"):
+            env[key.strip()] = value
+    return env
+
+
+def _normalize_env(env: Dict[str, str]) -> Dict[str, str]:
+    result, path_value = {}, ""
+    for key, value in env.items():
+        if key.lower() == "path":
+            if len(value) > len(path_value):
+                path_value = value
+        else:
+            result[key] = value
+    if path_value:
+        result["PATH"] = path_value
+    return result
+
+
+# ------------------------------------------------------------------ 基类
+class Toolchain:
+    name = "base"
+    default_abis: List[str] = []
+    use_abi_dir: bool = True
+    # 通过 POSIX shell 执行时，路径列表环境变量的分隔符
+    shell_path_separator: str = os.pathsep
+    default_ios_min = "12.0"
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.logger = ctx.logger
+        self.runner = ctx.runner
+
+    # 生命周期
+    def prepare(self) -> None:
+        """探测工具链，缺失时抛 ToolchainError。"""
+
+    def build_env(self, abi: str) -> Dict[str, str]:
+        raise NotImplementedError
+
+    def cmake_args(self, abi: str) -> List[str]:
+        raise NotImplementedError
+
+    # 路径
+    def install_dir(self, lib: str, abi: Optional[str] = None) -> Path:
+        root = self.ctx.output_root / lib / self.name
+        return root / abi if self.use_abi_dir and abi else root
+
+    # 执行
+    def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
+        """返回 (argv, 子进程 cwd)。"""
+        return ["/bin/bash", "-lc", script], cwd
+
+    def sh(self, script: str, cwd: Path, abi: str, env: Optional[Dict[str, str]] = None, **kw):
+        argv, effective_cwd = self.shell_command(script, cwd, abi)
+        return self.runner.run(argv, cwd=effective_cwd, env=env or self.build_env(abi), **kw)
+
+    def run(self, cmd, cwd: Path, abi: str, env: Optional[Dict[str, str]] = None, **kw):
+        return self.runner.run(list(cmd), cwd=cwd, env=env or self.build_env(abi), **kw)
+
+    # 产物
+    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
+        return requested or list(self.default_abis)
+
+    def finalize(self, lib: str, stages: Dict[str, Path]) -> Path:
+        target = self.install_dir(lib, next(iter(stages)) if self.use_abi_dir else None)
+        for abi, stage in stages.items():
+            destination = self.install_dir(lib, abi) if self.use_abi_dir else target
+            ensure_dir(destination)
+            for sub in ("include", "lib", "bin", "share"):
+                if (stage / sub).exists():
+                    copy_tree(stage / sub, destination / sub)
+            fix_pkgconfig_prefixes(destination)
+        return target
+
+
+# ------------------------------------------------------------------ Windows
+class WindowsToolchain(Toolchain):
+    """优先微软编译套件：MSVC + MSYS2(GNU make/install/perl/nasm)。"""
+
+    name = "windows"
+    default_abis = ["x64"]
+    use_abi_dir = True
+    shell_path_separator = ":"
+
+    def __init__(self, ctx, prefer: str = "auto"):
+        super().__init__(ctx)
+        self.prefer = prefer
+        self.msvc: Optional[MSVC] = None
+        self.msys2_root: Optional[Path] = None
+        self.msys2_bins: List[str] = []
+        self.ninja = self.cmake = None
+
+    def prepare(self) -> None:
+        self._detect_msys2()
+        if self.prefer in ("auto", "msvc"):
+            self.msvc = MSVC.discover(self.logger)
+        if self.msvc:
+            self.logger.info(f"MSVC: {self.msvc.install} (cl={which('cl', self.msvc.env)})")
+        elif self.prefer == "msvc":
+            raise ToolchainError("MSVC", "未检测到 VS / VS Build Tools",
+                                 "python build.py bootstrap --platform windows --install")
+        elif not (which("gcc") or (self.msys2_root and (self.msys2_root / "mingw64" / "bin" / "gcc.exe").exists())):
+            raise ToolchainError("MSVC/MinGW", "既无 MSVC 也无 MinGW",
+                                 "安装 VS Build Tools 或 MSYS2")
+
+        env = self.build_env(self.ctx.abis[0])
+        self.cmake = which("cmake", env)
+        self.ninja = which("ninja", env)
+        if not self.cmake:
+            raise ToolchainError("cmake", "未找到 cmake", "winget install Kitware.CMake")
+        if not which("make", env):
+            raise ToolchainError("make", "openh264 的 Makefile 需要 GNU make",
+                                 "MSYS2: pacman -S make，或 winget install MSYS2.MSYS2")
+        self.logger.info(f"工具链就绪: cmake={self.cmake} ninja={self.ninja or '-'}")
+
+    def _detect_msys2(self) -> None:
+        for candidate in MSYS2_CANDIDATES:
+            root = Path(candidate)
+            if (root / "usr" / "bin" / "bash.exe").exists():
+                self.msys2_root = root
+                self.msys2_bins = [str(root / "usr" / "bin")]
+                if (root / "mingw64" / "bin").exists():
+                    self.msys2_bins.append(str(root / "mingw64" / "bin"))
+                return
+
+    def build_env(self, abi: str = "x64") -> Dict[str, str]:
+        base = dict(self.msvc.env) if self.msvc else os.environ.copy()
+        if self.msys2_bins:
+            # MSVC 路径必须在前，MSYS2 只作为 GNU 工具补充（否则 cmake 会选到
+            # /usr/bin/c++.exe，GNU link.exe 也会抢在 MSVC link.exe 之前）
+            current = [p for p in base.get("PATH", "").split(os.pathsep) if p]
+            for entry in self.msys2_bins:
+                if entry not in current:
+                    current.append(entry)
+            base["PATH"] = os.pathsep.join(current)
+        return base
+
+    def cmake_args(self, abi: str = "x64") -> List[str]:
+        args = ["-G", "Ninja"] if self.ninja else []
+        if not self.ninja and self.msvc and self.msvc.generator:
+            args = ["-G", self.msvc.generator, "-A", "x64"]
+        args += ["-DCMAKE_BUILD_TYPE=Release"]
+        if self.msvc:
+            # 与 openssl/openh264/ffmpeg 的 /MT 保持一致，否则链接报 __imp_xxx 未解析
+            args += [
+                "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+                "-DCMAKE_C_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG",
+                "-DCMAKE_CXX_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG",
+            ]
+        return args
+
+    @property
+    def needs_config_type(self) -> bool:
+        return not bool(self.ninja)
+
+    def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
+        """MSYS2 登录 shell 不继承 Windows cwd，且会重排 PATH。
+
+        因此脚本内必须做两件事：cd 到工作目录（/d/... 形式），并把 MSVC 路径以
+        POSIX 形式（/c/...）置顶，否则 make 找不到 cl.exe。
+        """
+        prefix = self._msvc_path_prefix()
+        if prefix:
+            script = f'export PATH="{prefix}:$PATH" && {script}'
+        if cwd:
+            script = f'cd "{to_msys_path(cwd)}" && {script}'
+        return [self._bash(), "-lc", script], None
+
+    def _msvc_path_prefix(self) -> str:
+        if not self.msvc:
+            return ""
+        base = {p.rstrip("\\/").lower() for p in os.environ.get("PATH", "").split(os.pathsep)}
+        entries = [
+            to_msys_path(entry)
+            for entry in self.msvc.env.get("PATH", "").split(os.pathsep)
+            if entry and entry.rstrip("\\/").lower() not in base
+        ]
+        if self.msys2_root:
+            entries.append(str(self.msys2_root / "usr" / "bin").replace("\\", "/"))
+        return ":".join(entries)
+
+    def _bash(self) -> str:
+        if self.msys2_root:
+            return str(self.msys2_root / "usr" / "bin" / "bash.exe")
+        fallback = which("bash")
+        if fallback:
+            return fallback
+        raise ToolchainError("MSYS2", "未找到 MSYS2 bash", "安装 MSYS2 后 pacman -S make perl nasm")
+
+    def msys_path(self, path) -> str:
+        return to_msys_path(path)
+
+    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
+        valid = [a for a in (requested or []) if a in ("x64", "x86", "arm64")]
+        return valid or list(self.default_abis)
+
+
+# ------------------------------------------------------------------ Android
+ANDROID_ABI = {
+    "arm64-v8a": {"arch": "arm64", "triple": "aarch64-linux-android", "openssl": "android-arm64", "openh264": "arm64"},
+    "armeabi-v7a": {"arch": "arm", "triple": "armv7a-linux-androideabi", "openssl": "android-arm", "openh264": "arm"},
+    "x86_64": {"arch": "x86_64", "triple": "x86_64-linux-android", "openssl": "android-x86_64", "openh264": "x86_64"},
+}
+NDK_HOST = {"Darwin": "darwin-x86_64", "Windows": "windows-x86_64", "Linux": "linux-x86_64"}
+
+
+class AndroidToolchain(Toolchain):
+    name = "android"
+    default_abis = ["arm64-v8a"]
+
+    def __init__(self, ctx, ndk: Optional[str] = None, api: int = 21):
+        super().__init__(ctx)
+        self.ndk: Optional[Path] = None
+        self.ndk_hint = ndk
+        self.api = int(api or 21)
+        self.host_tag = NDK_HOST.get(platform_mod.system(), "linux-x86_64")
+
+    def prepare(self) -> None:
+        self.ndk = self._detect_ndk()
+        if not self.ndk:
+            raise ToolchainError("Android NDK", "未找到 NDK",
+                                 "设置 ANDROID_NDK_HOME 或 python build.py bootstrap --platform android --install")
+        if not (self.ndk / "toolchains" / "llvm" / "prebuilt" / self.host_tag).exists():
+            raise ToolchainError("Android NDK", f"缺少 {self.host_tag} 工具链", "检查 NDK 版本")
+        unknown = [a for a in self.ctx.abis if a not in ANDROID_ABI]
+        if unknown:
+            raise ToolchainError("Android ABI", f"不支持: {unknown}", f"可选: {', '.join(ANDROID_ABI)}")
+        self.logger.info(f"NDK: {self.ndk} (host={self.host_tag}, api={self.api})")
+
+    def _detect_ndk(self) -> Optional[Path]:
+        candidates: List[Path] = []
+        if self.ndk_hint:
+            candidates.append(Path(self.ndk_hint).expanduser())
+        for var in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK", "NDK21", "NDK20"):
+            if os.environ.get(var):
+                candidates.append(Path(os.environ[var]).expanduser())
+        for var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            root = os.environ.get(var)
+            if root:
+                candidates += sorted(Path(root).expanduser().glob("ndk/*"), reverse=True)
+        home = Path.home()
+        for sdk in (home / "Library/Android/sdk", home / "Android/Sdk"):
+            if sdk.exists():
+                candidates += sorted(sdk.glob("ndk/*"), reverse=True)
+        candidates += sorted((PROJECT_ROOT / TOOLS_DIR).glob("android-ndk*"), reverse=True)
+        for candidate in candidates:
+            if (candidate / "ndk-build").exists():
+                return candidate.resolve()
+        return None
+
+    @property
+    def toolchain_bin(self) -> Path:
+        return self.ndk / "toolchains" / "llvm" / "prebuilt" / self.host_tag / "bin"
+
+    def build_env(self, abi: str) -> Dict[str, str]:
+        spec = ANDROID_ABI[abi]
+        bin_dir, sysroot = self.toolchain_bin, self.toolchain_bin / "sysroot"
+        env = os.environ.copy()
+        env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
+        env.update({
+            "ANDROID_NDK_ROOT": str(self.ndk), "ANDROID_NDK": str(self.ndk),
+            "ANDROID_API": str(self.api), "SYSROOT": str(sysroot),
+            "CC": str(bin_dir / f"{spec['triple']}{self.api}-clang"),
+            "CXX": str(bin_dir / f"{spec['triple']}{self.api}-clang++"),
+            "AR": str(bin_dir / "llvm-ar"), "RANLIB": str(bin_dir / "llvm-ranlib"),
+            "STRIP": str(bin_dir / "llvm-strip"), "NM": str(bin_dir / "llvm-nm"),
+            "CFLAGS": "-fPIC -O3", "CXXFLAGS": "-fPIC -O3",
+        })
+        return env
+
+    def cmake_args(self, abi: str) -> List[str]:
+        return [
+            "-G", "Unix Makefiles",
+            f"-DCMAKE_TOOLCHAIN_FILE={self.ndk / 'build' / 'cmake' / 'android.toolchain.cmake'}",
+            f"-DANDROID_ABI={abi}", f"-DANDROID_PLATFORM=android-{self.api}",
+            "-DANDROID_STL=c++_static", "-DANDROID_ARM_NEON=ON", "-DCMAKE_BUILD_TYPE=Release",
+        ]
+
+    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
+        if not requested:
+            return list(self.default_abis)
+        expanded: List[str] = []
+        for item in requested:
+            expanded += ["arm64-v8a", "armeabi-v7a"] if item in ("all", "*") else [item]
+        return expanded or list(self.default_abis)
+
+
+# ------------------------------------------------------------------ iOS
+class IOSToolchain(Toolchain):
+    name = "ios"
+    default_abis = ["arm64", "x86_64"]
+    use_abi_dir = False          # 产物为 fat 库
+
+    def __init__(self, ctx, min_version: str = "12.0"):
+        super().__init__(ctx)
+        self.min_version = min_version or self.default_ios_min
+        self._sdk: Dict[str, str] = {}
+
+    def prepare(self) -> None:
+        if platform_mod.system() != "Darwin":
+            raise ToolchainError("Xcode", "iOS 只能在 macOS 上编译", "换一台装了 Xcode 的 Mac")
+        if not self._xcrun(["xcode-select", "-p"]):
+            raise ToolchainError("Xcode", "未找到 Xcode 命令行工具", "xcode-select --install")
+        for abi in self.ctx.abis:
+            if not self.sdk_path(abi):
+                raise ToolchainError("iOS SDK", f"缺少 {self.sdk_name(abi)}", "安装完整版 Xcode")
+        if not which("cmake"):
+            raise ToolchainError("cmake", "未找到 cmake", "brew install cmake")
+        if "x86_64" in self.ctx.abis and not which("nasm"):
+            raise ToolchainError("nasm", "x86_64 的 openh264 需要 nasm", "brew install nasm")
+        self.logger.info(f"Xcode 就绪，SDK: {[self.sdk_name(a) for a in self.ctx.abis]}")
+
+    @staticmethod
+    def sdk_name(abi: str) -> str:
+        return "iphonesimulator" if abi in ("x86_64", "i386", "arm64-simulator") else "iphoneos"
+
+    def sdk_path(self, abi: str) -> str:
+        if abi not in self._sdk:
+            self._sdk[abi] = self._xcrun(["xcrun", "--sdk", self.sdk_name(abi), "--show-sdk-path"])
+        return self._sdk[abi]
+
+    def build_env(self, abi: str) -> Dict[str, str]:
+        sim = self.sdk_name(abi) == "iphonesimulator"
+        flag = f"-mios-simulator-version-min={self.min_version}" if sim else f"-miphoneos-version-min={self.min_version}"
+        env = os.environ.copy()
+        env.update({"SDKROOT": self.sdk_path(abi), "IOS_MIN_VERSION": self.min_version,
+                    "CFLAGS": flag, "CXXFLAGS": flag, "LDFLAGS": flag})
+        return env
+
+    def cmake_args(self, abi: str) -> List[str]:
+        return ["-G", "Unix Makefiles", "-DCMAKE_SYSTEM_NAME=iOS",
+                f"-DCMAKE_OSX_SYSROOT={self.sdk_name(abi)}",
+                f"-DCMAKE_OSX_ARCHITECTURES={abi.replace('-simulator', '')}",
+                f"-DCMAKE_OSX_DEPLOYMENT_TARGET={self.min_version}", "-DCMAKE_BUILD_TYPE=Release"]
+
+    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
+        if not requested:
+            return list(self.default_abis)
+        expanded: List[str] = []
+        for item in requested:
+            if item in ("fat", "all", "*"):
+                expanded += list(self.default_abis)
+            elif item == "device":
+                expanded.append("arm64")
+            elif item == "simulator":
+                expanded.append("x86_64")
+            else:
+                expanded.append(item)
+        return list(dict.fromkeys(expanded)) or list(self.default_abis)
+
+    def finalize(self, lib: str, stages: Dict[str, Path]) -> Path:
+        """多架构 -> lipo 合并为 fat 库。"""
+        target = ensure_dir(self.install_dir(lib))
+        first = next(iter(stages.values()))
+        copy_tree(first / "include", target / "include")
+        lib_dir = ensure_dir(target / "lib")
+        for name in static_lib_names(first / "lib"):
+            inputs = [stage / "lib" / name for stage in stages.values()]
+            if len(stages) > 1:
+                lipo_create(self.runner, lib_dir / name, inputs)
+            else:
+                import shutil
+                shutil.copy2(inputs[0], lib_dir / name)
+        fix_pkgconfig_prefixes(target)
+        self.logger.info(f"[{lib}] fat 库 -> {target} ({', '.join(stages)})")
+        return target
+
+    def _xcrun(self, cmd: List[str]) -> str:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+TOOLCHAINS = {"windows": WindowsToolchain, "android": AndroidToolchain, "ios": IOSToolchain}
+PLATFORM_ALIASES = {"win": "windows", "win64": "windows", "mac": "ios", "iphoneos": "ios", "darwin": "ios"}
+
+
+def normalize_platform(name: str) -> str:
+    key = PLATFORM_ALIASES.get(name.strip().lower(), name.strip().lower())
+    if key not in TOOLCHAINS:
+        raise KeyError(f"未知平台: {name}，可选: {', '.join(TOOLCHAINS)}")
+    return key
+
+
+def create_toolchain(name: str, ctx, **kwargs) -> Toolchain:
+    cls = TOOLCHAINS[normalize_platform(name)]
+    if cls is WindowsToolchain:
+        return cls(ctx, prefer=kwargs.get("toolchain", "auto"))
+    if cls is AndroidToolchain:
+        return cls(ctx, ndk=kwargs.get("ndk"), api=kwargs.get("api", 21))
+    return cls(ctx, min_version=kwargs.get("min_version", "12.0"))
