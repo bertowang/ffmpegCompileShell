@@ -148,7 +148,8 @@ FfmpegCompileShell/
   decoder `h264,aac,png`、muxer `flv,mpegts`、demuxer `mov,flv,mp4`、parser `h264,aac`、
   bsf `h264_mp4toannexb,aac_adtstoasc,null`、filter `scale,format,aformat,aresample,overlay,null,anull`、
   protocol `file,tcp,tls,rtmp,rtmps,srt`
-* 关闭 `--disable-avdevice --disable-postproc --disable-programs --disable-doc --disable-iconv --disable-vulkan`
+* 关闭 `--disable-avdevice --disable-postproc --disable-doc --disable-iconv --disable-vulkan`
+  （**保留 programs**：`ffmpeg` / `ffprobe` CLI 用于验证产物可用性，它们是独立可执行文件，不进入 SDK 链接）
 * `--enable-small`；Windows 用 shared（dll + import lib），Android/iOS 用 static（`--disable-symver`）
 * openssl 按 RTMPS 场景裁剪：`no-apps no-tests no-docs no-ssl3 no-weak-ssl-ciphers no-comp no-dtls no-psk no-srtp`
 * 非 MSVC 编译加 `-ffunction-sections -fdata-sections`，最终链接 .so 时配 `-Wl,--gc-sections`

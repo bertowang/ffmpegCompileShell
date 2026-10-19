@@ -359,8 +359,10 @@ def _ffmpeg_common_args(ctx, abi, stage: Path, prefixes) -> List[str]:
         "--enable-openssl", "--enable-libfdk-aac", "--enable-libopenh264", "--enable-libsrt",
         "--enable-nonfree", "--enable-version3",
         # 关掉用不到的部分
+        # 注：保留 programs（ffmpeg/ffprobe CLI）用于验证产物可用性，
+        #     它们是独立可执行文件，不进入 SDK 链接，对库体积无影响。
         "--disable-avdevice", "--disable-postproc", "--disable-vulkan",
-        "--disable-programs", "--disable-doc", "--disable-htmlpages",
+        "--disable-doc", "--disable-htmlpages",
         "--disable-manpages", "--disable-podpages", "--disable-txtpages",
         "--disable-debug", "--disable-iconv",
         "--enable-small", "--enable-pic",
