@@ -59,6 +59,8 @@ def check(platform: str, logger: Logger, ctx=None) -> CheckResult:
         result.statuses = _check_windows(logger)
     elif platform == "android":
         result.statuses = _check_android(ctx)
+    elif platform == "ohos":
+        result.statuses = _check_ohos(ctx)
     else:
         result.statuses = _check_ios()
     return result
@@ -98,6 +100,41 @@ def _check_android(ctx) -> List[ToolStatus]:
     ]
 
 
+def _check_ohos(ctx) -> List[ToolStatus]:
+    sdk = ""
+    if ctx is not None and getattr(ctx, "toolchain", None) is not None:
+        try:
+            sdk = str(ctx.toolchain.detect_sdk() or "")
+        except Exception:  # noqa: BLE001
+            sdk = ""
+    env = dict(os.environ)
+    if sdk:
+        from pathlib import Path
+        env["PATH"] = os.pathsep.join([str(Path(sdk) / "native" / "llvm" / "bin"),
+                                       str(Path(sdk) / "native" / "build-tools" / "cmake" / "bin"),
+                                       env.get("PATH", "")])
+    sdk_cmake = _ohos_sdk_cmake(sdk)
+    return [
+        ToolStatus("OHOS SDK", bool(sdk), sdk,
+                   "安装 DevEco Studio/commandline-tools 后 export OHOS_SDK=<.../sdk/default/openharmony>"),
+        ToolStatus("cmake(SDK 自带优先)", bool(sdk_cmake or which("cmake", env)),
+                   sdk_cmake or which("cmake", env) or "", "apt install cmake / brew install cmake"),
+        ToolStatus("make", bool(which("make", env)), which("make", env) or "", "apt install make / brew install make"),
+        ToolStatus("perl", bool(which("perl", env)), which("perl", env) or "",
+                   "openssl 的 Configure 需要 perl：apt install perl"),
+        ToolStatus("bash(宿主)", pl.system() != "Windows" or bool(which("bash", env)), pl.system(),
+                   "OHOS 交叉编译依赖 bash/GNU make；Windows 请装 MSYS2/Git Bash 或改用 WSL"),
+    ]
+
+
+def _ohos_sdk_cmake(sdk: str) -> str:
+    if not sdk:
+        return ""
+    from pathlib import Path
+    candidate = Path(sdk) / "native" / "build-tools" / "cmake" / "bin" / "cmake"
+    return str(candidate) if candidate.exists() else ""
+
+
 def _check_ios() -> List[ToolStatus]:
     on_mac = pl.system() == "Darwin"
     xcode = _run(["xcode-select", "-p"]) if on_mac else ""
@@ -129,6 +166,8 @@ def install(platform: str, result: CheckResult, logger: Logger, runner: CommandR
             actions += _install_windows(status, logger, runner, tools)
         elif platform == "android":
             actions += _install_android(status, logger, tools)
+        elif platform == "ohos":
+            actions += _install_ohos(status)
         else:
             actions += _install_ios(status, logger, runner)
     return actions
@@ -177,6 +216,11 @@ def _install_android(status: ToolStatus, logger: Logger, tools: Path) -> List[st
                         tools, logger)
         return [f"NDK -> {tools / f'android-ndk-{NDK_VERSION}'}"]
     return [f"{status.name} 缺失：brew install {status.name}"]
+
+
+def _install_ohos(status: ToolStatus) -> List[str]:
+    """OHOS SDK 只能由 DevEco Studio / commandline-tools 下载，这里只给指引。"""
+    return [f"{status.name} 缺失：{status.hint}"]
 
 
 def _install_ios(status: ToolStatus, logger: Logger, runner: CommandRunner) -> List[str]:

@@ -1,4 +1,4 @@
-"""平台/工具链适配：Windows(MSVC) / Android(NDK) / iOS(Xcode)。
+"""平台/工具链适配：Windows(MSVC) / Android(NDK) / iOS(Xcode) / OHOS(OpenHarmony)。
 
 新增一个平台：继承 :class:`Toolchain` 并在 :data:`TOOLCHAINS` 中注册。
 """
@@ -472,6 +472,11 @@ class IOSToolchain(Toolchain):
             else:
                 import shutil
                 shutil.copy2(inputs[0], lib_dir / name)
+        # 静态库之外还有 cmake/pkgconfig 等元数据，从第一个架构直接带出
+        for extra in ("cmake", "pkgconfig"):
+            source_dir = first / "lib" / extra
+            if source_dir.exists():
+                copy_tree(source_dir, lib_dir / extra)
         fix_pkgconfig_prefixes(target)
         self.logger.info(f"[{lib}] fat 库 -> {target} ({', '.join(stages)})")
         return target
@@ -484,8 +489,174 @@ class IOSToolchain(Toolchain):
         return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-TOOLCHAINS = {"windows": WindowsToolchain, "android": AndroidToolchain, "ios": IOSToolchain}
-PLATFORM_ALIASES = {"win": "windows", "win64": "windows", "mac": "ios", "iphoneos": "ios", "darwin": "ios"}
+# ------------------------------------------------------------------ OHOS
+# OpenHarmony：使用 DevEco / commandline-tools 自带的 LLVM + CMake 交叉编译。
+# 环境变量与 OHOS 官方 ohos.toolchain.cmake 约定一致。
+OHOS_ABI = {
+    "arm64-v8a": {"arch": "aarch64", "triple": "aarch64-unknown-linux-ohos",
+                  "openssl": "linux-aarch64", "openh264": "arm64", "march": "", "neon": True},
+    "armeabi-v7a": {"arch": "arm", "triple": "armv7-unknown-linux-ohos",
+                    "openssl": "linux-armv4", "openh264": "arm", "march": "-march=armv7a", "neon": False},
+    "x86_64": {"arch": "x86_64", "triple": "x86_64-unknown-linux-ohos",
+               "openssl": "linux-x86_64", "openh264": "x86_64", "march": "", "neon": False},
+}
+OHOS_SDK_ENV_VARS = ("OHOS_SDK", "OHOS_SDK_HOME", "OHOS_NDK_HOME", "HOS_SDK_HOME", "DEVECO_SDK_HOME")
+OHOS_SDK_GLOBS = (
+    "~/Library/Huawei/Sdk/*/openharmony",             # macOS DevEco Studio
+    "~/AppData/Local/Huawei/Sdk/*/openharmony",       # Windows DevEco Studio
+    "/Applications/DevEco Studio.app/Contents/sdk/*/openharmony",
+    "C:/Program Files/Huawei/DevEco Studio/sdk/*/openharmony",
+)
+
+
+class OHOSToolchain(Toolchain):
+    name = "ohos"
+    default_abis = ["arm64-v8a"]
+
+    def __init__(self, ctx, sdk: Optional[str] = None):
+        super().__init__(ctx)
+        self.sdk_hint = sdk
+        self.sdk: Optional[Path] = None
+        self.cmake_bin = ""
+        self.ninja = ""
+
+    # 生命周期
+    def prepare(self) -> None:
+        self.sdk = self.detect_sdk()
+        if not self.sdk:
+            raise ToolchainError(
+                "OHOS SDK", "未找到 OpenHarmony SDK",
+                "设置 OHOS_SDK=<.../sdk/default/openharmony>，或 python build.py bootstrap --platform ohos")
+        missing_dirs = [p for p in (self.llvm_bin, self.sysroot) if not p.exists()]
+        if missing_dirs:
+            raise ToolchainError("OHOS SDK", f"SDK 不完整，缺少: {', '.join(str(p) for p in missing_dirs)}",
+                                 "确认 OHOS_SDK 指向含 native/{llvm,sysroot} 的目录")
+        unknown = [a for a in self.ctx.abis if a not in OHOS_ABI]
+        if unknown:
+            raise ToolchainError("OHOS ABI", f"不支持: {unknown}", f"可选: {', '.join(OHOS_ABI)}")
+        # openssl/openh264/ffmpeg 都通过 bash + GNU make 构建，perl 用于 openssl Configure
+        if not self._find_bash():
+            raise ToolchainError("bash", "OHOS 交叉编译需要 bash（Linux/macOS 原生，或 Windows 上的 MSYS2/Git Bash）",
+                                 "在 WSL 或 Linux/macOS 上执行，或安装 MSYS2")
+        env = self.build_env(self.ctx.abis[0])
+        self.cmake_bin = self._sdk_tool("cmake") or which("cmake", env) or ""
+        if not self.cmake_bin:
+            raise ToolchainError("cmake", "未找到 cmake", "apt install cmake / brew install cmake")
+        self.ninja = self._sdk_tool("ninja") or which("ninja", env) or ""
+        if not which("make", env):
+            raise ToolchainError("make", "openssl/openh264/ffmpeg 需要 GNU make", "apt install make / brew install make")
+        if not which("perl", env):
+            raise ToolchainError("perl", "openssl 的 Configure 需要 perl", "apt install perl / brew install perl")
+        self.logger.info(f"OHOS SDK: {self.sdk} (cmake={self.cmake_bin}, ninja={self.ninja or '-'})")
+        if not self.toolchain_file.exists():
+            self.logger.warn(f"SDK 缺少 {self.toolchain_file}，CMake 交叉编译可能失败")
+
+    def detect_sdk(self) -> Optional[Path]:
+        candidates: List[Path] = []
+        if self.sdk_hint:
+            candidates.append(Path(self.sdk_hint).expanduser())
+        for var in OHOS_SDK_ENV_VARS:
+            if os.environ.get(var):
+                candidates.append(Path(os.environ[var]).expanduser())
+        for pattern in OHOS_SDK_GLOBS:
+            candidates += sorted(Path(pattern).expanduser().parent.glob(Path(pattern).name), reverse=True)
+        candidates += sorted((PROJECT_ROOT / TOOLS_DIR).glob("ohos-sdk*"), reverse=True)
+        for candidate in candidates:
+            resolved = self._as_sdk_root(candidate)
+            if resolved:
+                return resolved
+        return None
+
+    @staticmethod
+    def _as_sdk_root(path: Path) -> Optional[Path]:
+        """兼容两种写法：.../openharmony 与 .../openharmony/native。"""
+        try:
+            if (path / "native" / "llvm").exists():
+                return path.resolve()
+            if path.name == "native" and (path / "llvm").exists():
+                return path.parent.resolve()
+        except OSError:
+            return None
+        return None
+
+    # 路径
+    @property
+    def llvm_bin(self) -> Path:
+        return self.sdk / "native" / "llvm" / "bin"
+
+    @property
+    def sysroot(self) -> Path:
+        return self.sdk / "native" / "sysroot"
+
+    @property
+    def build_tools_bin(self) -> Path:
+        return self.sdk / "native" / "build-tools" / "cmake" / "bin"
+
+    @property
+    def toolchain_file(self) -> Path:
+        return self.sdk / "native" / "build" / "cmake" / "ohos.toolchain.cmake"
+
+    def _sdk_tool(self, name: str) -> str:
+        candidate = self.build_tools_bin / name
+        return str(candidate) if candidate.exists() else ""
+
+    def build_env(self, abi: str) -> Dict[str, str]:
+        spec = OHOS_ABI[abi]
+        llvm, sysroot = self.llvm_bin, self.sysroot
+        env = os.environ.copy()
+        extra = [str(llvm)]
+        if self.build_tools_bin.exists():
+            extra.append(str(self.build_tools_bin))
+        env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+        march = spec["march"]
+        cflags = " ".join(x for x in ("-DOHOS_NDK", "-fPIC", march, "-D__MUSL__=1") if x)
+        env.update({
+            "OHOS_SDK": str(self.sdk), "OHOS_ARCH": abi, "SYSROOT": str(sysroot),
+            "AS": str(llvm / "llvm-as"),
+            "CC": str(llvm / f"{spec['triple']}-clang"),
+            "CXX": str(llvm / f"{spec['triple']}-clang++"),
+            "LD": str(llvm / "ld.lld"),
+            "AR": str(llvm / "llvm-ar"), "RANLIB": str(llvm / "llvm-ranlib"),
+            "STRIP": str(llvm / "llvm-strip"), "NM": str(llvm / "llvm-nm"),
+            "OBJDUMP": str(llvm / "llvm-objdump"), "OBJCOPY": str(llvm / "llvm-objcopy"),
+            "CFLAGS": cflags, "CXXFLAGS": cflags, "LDFLAGS": "",
+        })
+        return env
+
+    def cmake_args(self, abi: str) -> List[str]:
+        return [
+            "-G", "Ninja" if self.ninja else "Unix Makefiles",
+            f"-DCMAKE_TOOLCHAIN_FILE={self.toolchain_file}",
+            "-DOHOS_PLATFORM=OHOS", f"-DOHOS_ARCH={abi}",
+            "-DCMAKE_BUILD_TYPE=Release",
+        ]
+
+    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
+        if not requested:
+            return list(self.default_abis)
+        expanded: List[str] = []
+        for item in requested:
+            expanded += list(OHOS_ABI) if item in ("all", "*") else [item]
+        return expanded or list(self.default_abis)
+
+    # 执行：Linux/macOS 用系统 bash；Windows 用 MSYS2/Git Bash
+    def _find_bash(self) -> str:
+        if platform_mod.system() != "Windows":
+            return "/bin/bash"
+        for candidate in MSYS2_CANDIDATES:
+            bash = Path(candidate) / "usr" / "bin" / "bash.exe"
+            if bash.exists():
+                return str(bash)
+        return which("bash") or ""
+
+    def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
+        return [self._find_bash() or "/bin/bash", "-lc", script], cwd
+
+
+TOOLCHAINS = {"windows": WindowsToolchain, "android": AndroidToolchain,
+              "ios": IOSToolchain, "ohos": OHOSToolchain}
+PLATFORM_ALIASES = {"win": "windows", "win64": "windows", "mac": "ios", "iphoneos": "ios", "darwin": "ios",
+                    "openharmony": "ohos", "harmonyos": "ohos", "harmony": "ohos", "oh": "ohos"}
 
 
 def normalize_platform(name: str) -> str:
@@ -501,4 +672,6 @@ def create_toolchain(name: str, ctx, **kwargs) -> Toolchain:
         return cls(ctx, prefer=kwargs.get("toolchain", "auto"))
     if cls is AndroidToolchain:
         return cls(ctx, ndk=kwargs.get("ndk"), api=kwargs.get("api", 21))
+    if cls is OHOSToolchain:
+        return cls(ctx, sdk=kwargs.get("ohos_sdk"))
     return cls(ctx, min_version=kwargs.get("min_version", "12.0"))

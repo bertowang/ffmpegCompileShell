@@ -26,7 +26,9 @@ def _set_current(lib: str) -> None:
 def cmake_configure(ctx, src: Path, build_dir: Path, abi: str, extra: Optional[List[str]] = None) -> None:
     build_dir = Path(build_dir)
     ensure_dir(build_dir)
-    cmd = ["cmake", "-S", str(src), "-B", str(build_dir)]
+    # OHOS 必须用 SDK 自带 cmake（系统 cmake 版本/规则不兼容 ohos.toolchain.cmake）
+    cmake = getattr(ctx.toolchain, "cmake_bin", "") or "cmake"
+    cmd = [cmake, "-S", str(src), "-B", str(build_dir)]
     cmd += ctx.toolchain.cmake_args(abi)
     cmd += [f"-DCMAKE_INSTALL_PREFIX={ctx.stage_dir(CURRENT_LIB['name'], abi)}",
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]   # CMake 4 需要，兼容老项目(如 srt)
@@ -91,6 +93,12 @@ def build_openssl(ctx, abi: str) -> Path:
             target = ANDROID_ABI[abi]["openssl"]
             configure = (f"./Configure {target} -D__ANDROID_API__={toolchain.api} "
                          f"{' '.join(OPENSSL_OPTIONS)} --prefix={stage} --openssldir={stage}/ssl")
+        elif platform == "ohos":
+            # OHOS 是 musl + linux 内核，直接用 openssl 的 linux-* target
+            from .toolchains import OHOS_ABI
+            target = OHOS_ABI[abi]["openssl"]
+            configure = (f"./Configure {target} -fPIC {' '.join(OPENSSL_OPTIONS)} "
+                         f"--prefix={stage} --openssldir={stage}/ssl")
         else:
             configure = (f"./Configure {IOS_OPENSSL_TARGETS.get(abi, 'ios64-xcrun')} "
                          f"{' '.join(OPENSSL_OPTIONS)} --prefix={stage} --openssldir={stage}/ssl")
@@ -186,6 +194,11 @@ def build_openh264(ctx, abi: str) -> Path:
                   f"GCC_TOOLCHAIN_PATH={bin_dir} SYSROOT={bin_dir / 'sysroot'} "
                   f"TOOLCHAIN_NAME={spec['triple']} TARGET_NAME={spec['triple']}{toolchain.api} "
                   f"install-static PREFIX={stage}")
+    elif platform == "ohos":
+        # OHOS 基于 linux 内核，openh264 走 OS=linux（编译器由 build_env 的 CC/CXX 指定）
+        from .toolchains import OHOS_ABI
+        script = (f"make -j{ctx.jobs} OS=linux ARCH={OHOS_ABI[abi]['openh264']} "
+                  f"install-static PREFIX={stage}")
     else:
         script = (f"make -j{ctx.jobs} OS=ios ARCH={abi.replace('-simulator', '')} "
                   f"SDK_MIN={toolchain.min_version} install-static PREFIX={stage}")
@@ -269,14 +282,37 @@ def build_json(ctx, abi: str) -> Path:
     return stage
 
 
+# ------------------------------------------------------------------- spdlog
+# MediaX 的 ESLogger 用 spdlog 作为日志实现（编译型静态库，非 header-only）：
+# 链接方需带 SPDLOG_COMPILED_LIB（spdlog::spdlog target 会自动传播该宏）。
+def build_spdlog(ctx, abi: str) -> Path:
+    _set_current("spdlog")
+    src = ctx.sources.ensure(C.LIBRARIES["spdlog"].source, ctx.source_dir("spdlog"), ctx.force_fetch)
+    build_dir = ctx.work_dir("spdlog", abi) / "cmake-build"
+    cmake_configure(ctx, src, build_dir, abi, extra=[
+        "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DSPDLOG_INSTALL=ON",
+        # 关掉示例/测试/基准，避免多编译若干可执行目标
+        "-DSPDLOG_BUILD_EXAMPLE=OFF", "-DSPDLOG_BUILD_EXAMPLE_HO=OFF",
+        "-DSPDLOG_BUILD_TESTS=OFF", "-DSPDLOG_BUILD_TESTS_HO=OFF",
+        "-DSPDLOG_BUILD_BENCH=OFF",
+        # 用 spdlog 自带 fmt，避免额外引入 fmt 依赖
+        "-DSPDLOG_FMT_EXTERNAL=OFF",
+    ])
+    cmake_build(ctx, build_dir, abi, lib="spdlog")
+    cmake_install(ctx, build_dir, abi, lib="spdlog")
+    return ctx.stage_dir("spdlog", abi)
+
+
 # -------------------------------------------------------------------- ffmpeg
 def build_ffmpeg(ctx, abi: str) -> Path:
     _set_current("ffmpeg")
     stage = ensure_dir(ctx.stage_dir("ffmpeg", abi))
     lib = C.LIBRARIES["ffmpeg"]
 
+    # 个别平台使用专用源码（OHOS 用 openharmony-tpc 的 fork）
+    source = C.FFMPEG_PLATFORM_SOURCE.get(ctx.platform, lib.source)
     # 允许 --ffmpeg-ref 覆盖仓库分支/标签
-    source = lib.source
     if ctx.ffmpeg_ref and ctx.ffmpeg_ref != source.ref:
         from dataclasses import replace
         from .utils import GitSource
@@ -394,6 +430,23 @@ def _ffmpeg_platform_args(ctx, abi) -> List[str]:
                 "--enable-static", "--disable-shared", "--disable-symver",
                 "--extra-cflags=-fPIC", "--extra-libs=-lm"]
 
+    if ctx.platform == "ohos":
+        from .toolchains import OHOS_ABI
+        spec = OHOS_ABI[abi]
+        bin_dir = ctx.toolchain.llvm_bin
+        args = ["--target-os=linux", f"--arch={spec['arch']}", "--enable-cross-compile",
+                f"--cc='{bin_dir / (spec['triple'] + '-clang')}'",
+                f"--cxx='{bin_dir / (spec['triple'] + '-clang++')}'",
+                f"--ar='{bin_dir / 'llvm-ar'}'", f"--nm='{bin_dir / 'llvm-nm'}'",
+                f"--ranlib='{bin_dir / 'llvm-ranlib'}'", f"--strip='{bin_dir / 'llvm-strip'}'",
+                f"--sysroot='{ctx.toolchain.sysroot}'",
+                "--disable-x86asm", "--disable-symver",
+                "--enable-static", "--disable-shared", "--extra-libs=-lm"]
+        if spec.get("neon"):
+            args.append("--enable-neon")
+        args += list(C.OHOS_FFMPEG_EXTRA_ARGS)
+        return args
+
     toolchain = ctx.toolchain
     arch = abi.replace("-simulator", "")
     sim = toolchain.sdk_name(abi) == "iphonesimulator"
@@ -418,5 +471,6 @@ REGISTRY = {
     "openh264": build_openh264,
     "libyuv": build_libyuv,
     "json": build_json,
+    "spdlog": build_spdlog,
     "ffmpeg": build_ffmpeg,
 }

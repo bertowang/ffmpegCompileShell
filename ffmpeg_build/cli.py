@@ -11,26 +11,30 @@ from pathlib import Path
 from typing import List
 
 from . import bootstrap
-from .config import (BUILD_ORDER, OPTIONAL_LIBRARIES, BuildContext, LIBRARIES,
+from .config import (BUILD_ORDER, ENV_OUTPUT, OPTIONAL_LIBRARIES, BuildContext, LIBRARIES,
                      resolve_output_root, resolve_selection)
 from .recipes import REGISTRY
 from .toolchains import TOOLCHAINS, create_toolchain, normalize_platform
 from .utils import CommandRunner, Logger, static_lib_names, write_version_file
 
-PLATFORM_HELP = "目标平台: windows(本机 MSVC) / android(mac 交叉编译) / ios(mac 编译)"
+PLATFORM_HELP = ("目标平台: windows(本机 MSVC) / android(交叉编译) / ios(mac 编译) / "
+                 "ohos(OpenHarmony，需 OHOS SDK，Linux/macOS 宿主)")
+ABI_HELP = ("windows: x64/x86/arm64; android: arm64-v8a/armeabi-v7a/x86_64; "
+            "ios: arm64/x86_64/fat; ohos: arm64-v8a/armeabi-v7a/x86_64")
 
 
 # ------------------------------------------------------------------ 参数
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="build.py",
-        description="ffmpeg 及其依赖库编译脚本（开播链路，产物输出到 TGCapture3rd）",
+        description="ffmpeg 及其依赖库编译脚本（开播链路；产物目录必须由 -o/--output 显式指定）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=("示例:\n"
+        epilog=(f"示例（--output 必填，也可改设环境变量 {ENV_OUTPUT}）:\n"
                 "  python build.py bootstrap --platform windows --install\n"
-                "  python build.py build --platform windows\n"
-                "  python build.py build --platform android --abi arm64-v8a\n"
-                "  python build.py build --platform ios --libs ffmpeg\n"))
+                "  python build.py build --platform windows -o D:/work/TGCapture3rd\n"
+                "  python build.py build --platform android --abi arm64-v8a -o D:/work/TGCapture3rd\n"
+                "  python build.py build --platform ios --libs ffmpeg -o D:/work/TGCapture3rd\n"
+                "  OHOS_SDK=~/ohos-sdk python build.py build --platform ohos -o D:/work/TGCapture3rd\n"))
     parser.add_argument("-q", "--quiet", action="store_true", help="减少输出")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -41,37 +45,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_boot.add_argument("--install", action="store_true", help="自动下载/安装缺失工具")
     p_boot.set_defaults(func=cmd_bootstrap)
 
-    p_fetch = sub.add_parser("fetch", help="只拉取源码")
-    _common(p_fetch)
+    p_fetch = sub.add_parser("fetch", help="只拉取源码（不落盘产物，无需 --output）")
+    _common(p_fetch, require_output=False)
     p_fetch.set_defaults(func=cmd_fetch)
 
-    p_build = sub.add_parser("build", help="编译依赖库")
-    _common(p_build)
+    p_build = sub.add_parser("build", help="编译依赖库（必须指定 --output）")
+    _common(p_build, require_output=True)
     p_build.add_argument("--clean", action="store_true", help="编译前清理中间目录与旧产物")
     p_build.add_argument("--dry-run", action="store_true", help="只打印将执行的命令")
     p_build.add_argument("--no-check", action="store_true", help="跳过工具链自检")
-    p_build.add_argument("--ffmpeg-ref", default="master", help="ffmpeg 仓库分支/标签，默认 master")
+    p_build.add_argument("--ffmpeg-ref", default=None, help="ffmpeg 仓库分支/标签，默认用 config.py 中的 ref")
     p_build.add_argument("--lto", action="store_true", help="ffmpeg 开启 LTO（默认关闭）")
     p_build.add_argument("--enable-nvenc", action="store_true", help="Windows 启用 NVENC（需 nv-codec-headers）")
     p_build.set_defaults(func=cmd_build)
 
-    p_clean = sub.add_parser("clean", help="清理中间产物")
-    _common(p_clean)
+    p_clean = sub.add_parser("clean", help="清理中间产物（--all 时还需 --output）")
+    _common(p_clean, require_output=True)
     p_clean.add_argument("--all", action="store_true", help="同时删除 TGCapture3rd 中对应库")
     p_clean.set_defaults(func=cmd_clean)
     return parser
 
 
-def _common(parser: argparse.ArgumentParser) -> None:
+def _common(parser: argparse.ArgumentParser, require_output: bool = True) -> None:
     parser.add_argument("-p", "--platform", required=True, help=PLATFORM_HELP)
-    parser.add_argument("--abi", nargs="*", default=None,
-                        help="windows: x64; android: arm64-v8a/armeabi-v7a/x86_64; ios: arm64/x86_64/fat")
+    parser.add_argument("--abi", nargs="*", default=None, help=ABI_HELP)
     parser.add_argument("--libs", default="all", help="要处理的库，逗号分隔")
-    parser.add_argument("-o", "--output", default=None, help="产物根目录，默认工程同级 TGCapture3rd")
+    parser.add_argument("-o", "--output", default=None,
+                        help=f"产物输出目录（必填；也可设环境变量 {ENV_OUTPUT}）")
     parser.add_argument("-j", "--jobs", type=int, default=0, help="并行任务数")
     parser.add_argument("--toolchain", default="auto", choices=["auto", "msvc", "mingw"], help="Windows 工具链偏好")
     parser.add_argument("--ndk", default=None, help="Android NDK 路径")
     parser.add_argument("--api", type=int, default=21, help="Android API，默认 21")
+    parser.add_argument("--ohos-sdk", default=None, help="OHOS SDK 根目录（含 native/），默认取 $OHOS_SDK")
     parser.add_argument("--min-version", default="12.0", help="iOS 最低版本，默认 12.0")
     parser.add_argument("--force-fetch", action="store_true", help="强制重新拉取源码")
 
@@ -85,7 +90,7 @@ def cmd_list(args, logger: Logger) -> int:
     for name in BUILD_ORDER:
         lib = LIBRARIES[name]
         logger.info(f"{name:<10} {lib.version:<10} {lib.summary}")
-    logger.section("可选（header-only，按需 --libs json）")
+    logger.section("可选（默认不构建，按需 --libs json,spdlog）")
     for name in OPTIONAL_LIBRARIES:
         lib = LIBRARIES[name]
         logger.info(f"{name:<10} {lib.version:<10} {lib.summary}")
@@ -94,7 +99,7 @@ def cmd_list(args, logger: Logger) -> int:
 
 
 def cmd_bootstrap(args, logger: Logger) -> int:
-    ctx = make_context(args, logger)
+    ctx = make_context(args, logger, require_output=False)
     result = bootstrap.check(ctx.platform, logger, ctx)
     bootstrap.report(result, logger)
     if args.install and result.missing:
@@ -105,7 +110,7 @@ def cmd_bootstrap(args, logger: Logger) -> int:
 
 
 def cmd_fetch(args, logger: Logger) -> int:
-    ctx = make_context(args, logger)
+    ctx = make_context(args, logger, require_output=False)
     for name in _ordered(args.libs):
         logger.section(f"fetch {name}")
         ctx.sources.ensure(LIBRARIES[name].source, ctx.source_dir(name), ctx.force_fetch)
@@ -162,16 +167,16 @@ def _ordered(selection: str) -> List[str]:
     return ordered + [n for n in names if n not in ordered]
 
 
-def make_context(args, logger: Logger) -> BuildContext:
+def make_context(args, logger: Logger, require_output: bool = True) -> BuildContext:
     platform = normalize_platform(args.platform)
     ctx = BuildContext(
         platform=platform,
         abis=[],
-        output_root=resolve_output_root(getattr(args, "output", None)),
+        output_root=resolve_output_root(getattr(args, "output", None), required=require_output),
         jobs=getattr(args, "jobs", 0) or 0,
         force_fetch=getattr(args, "force_fetch", False),
         dry_run=getattr(args, "dry_run", False),
-        ffmpeg_ref=getattr(args, "ffmpeg_ref", "master"),
+        ffmpeg_ref=getattr(args, "ffmpeg_ref", None),
         ffmpeg_lto=getattr(args, "lto", False),
         enable_nvenc=getattr(args, "enable_nvenc", False),
     )
@@ -181,6 +186,7 @@ def make_context(args, logger: Logger) -> BuildContext:
     ctx.sources.logger = logger
     ctx.toolchain = create_toolchain(platform, ctx, toolchain=getattr(args, "toolchain", "auto"),
                                      ndk=getattr(args, "ndk", None), api=getattr(args, "api", 21),
+                                     ohos_sdk=getattr(args, "ohos_sdk", None),
                                      min_version=getattr(args, "min_version", "12.0"))
     ctx.toolchain.logger = logger
     ctx.toolchain.runner = ctx.runner
