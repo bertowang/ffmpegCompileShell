@@ -44,6 +44,100 @@
 
 不使用 x264 / x265 / v265；AMF、nv-codec-headers、zlib、cuda-samples(NPP) 经复核均非开播编译期依赖，故不纳入。
 
+### 1.1 依赖锁定文件 `config/capture_deps.json`
+
+所有依赖的 **地址 / 版本 / commit** 统一锁在独立的 `config/` 目录里，按**用途**分文件命名：
+
+| 文件 | 用途 | 状态 |
+| - | - | - |
+| `config/capture_deps.json` | **开播**（capture） | 当前的正式配置，默认加载 |
+| `config/player_deps.json` | **播放**（player） | 示例骨架：`ffmpeg 6.1.6` + `json` + `spdlog`（不含 openssl/srt/fdk-aac/openh264/libyuv） |
+
+两份文件互不干扰：`config.py` 只加载本次指定的那一份，**锁定文件里没列的库不会进入构建集合**
+（所以 player 下 `python build.py list` 只会看到 ffmpeg / json / spdlog）。
+
+**只要确定这个文件，任何时候都能编出完全相同的目标库**，`config.py` 只保留用途描述。
+
+编译时显式指定用哪一份（默认即 `config/capture_deps.json`）：
+
+```bash
+python build.py build --platform windows -o D:/work/TGCapture3rd                      # 默认 capture
+python build.py build --platform windows --profile player  ...                         # config/player_deps.json
+python build.py build --platform windows --config-dir D:/work/mycfg ...                # 换配置目录
+python build.py build --platform windows --deps D:/work/capture_deps.json ...          # 直接给文件
+# 等价环境变量：FFMPEG_3RD_PROFILE / FFMPEG_3RD_CONFIG_DIR / FFMPEG_3RD_DEPS
+```
+
+所有子命令（`list` / `bootstrap` / `fetch` / `build` / `clean`）都支持这三个参数；
+`list` 与 `build` 开头会打印本次实际加载的锁定文件路径与 profile，便于回溯产物来源。
+
+```jsonc
+"openssl": { "kind": "archive", "version": "3.6.5",
+             "url": "https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz",
+             "tag": "openssl-3.6.5", "commit": "c8bd5a57108599ac650bbae77fcabe3109dab2e8" },
+"libyuv":  { "kind": "git", "version": "1974", "url": "https://chromium.googlesource.com/libyuv/libyuv",
+             "ref": "2404f9730e2e48946d29c6d28e3b630302a8d842", "commit": "2404f9730e2e48946d29c6d28e3b630302a8d842" },
+"ffmpeg":  { "kind": "git", "version": "6.1.6",
+             "url": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6.git",   // 唯一使用内网的库
+             "commit": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1" }
+```
+
+分三组（与 ffmpeg 的耦合关系）：
+
+| 组 | 含义 | 库 |
+| - | - | - |
+| `ffmpeg` | FFmpeg 自身源码，按**用途(profile)**再分档 | `ffmpeg`（capture 文件里 profile=**capture**；player 文件里 profile=**player**） |
+| `ffmpeg_deps` | FFmpeg 的**构建期依赖**，需对应 `--enable-*`，产物静态并入 avcodec/avformat | `openssl`、`srt`、`fdk-aac`、`openh264` |
+| `standalone` | 与 FFmpeg **无关**的独立库，应用直接链接 | `libyuv`、`json`、`spdlog` |
+
+规则：
+
+* **内网仓库**（`EST/media/e-ffmpeg`）：`ffmpeg`（ffmpeg-6.1.6）、`fdk-aac`（fdk_aac_v2.0.3）。
+* 其余库用**上游官方仓库**，取锁定日（`updated` 字段）的最新正式发布版；
+  个别库为兼容 MediaX 会锁在旧版（如 `spdlog` 锁 v1.14.1，条目里有 `note` 说明原因）。
+* ffmpeg 的 `capture`（开播）标记会写进版本文件名，与将来的 `player` 产物区分：
+
+  ```
+  version-ffmpeg-6.1.6-g3c1fc5df-2026-10-19-10-32.windows.x64.capture.msvc.txt
+  version-spdlog-v1.14.1-g27cb4c767-2026-10-19-20-36.windows.x64.msvc.txt
+  ```
+* git 类依赖一律锁到 **commit**（不是 tag），归档类锁到 **release tag**（可选填 `sha256`）。
+* 源码目录会写入 `.deps_pin`；若锁定文件改了版本，下次构建会**自动重新拉取**，
+  不会误用旧源码（这是可复现的关键）。
+
+升级某个库，只改 `config/capture_deps.json` 对应条目即可，无需动 `config.py`。
+
+### 1.2 profile：开播(capture) 与 播放(player)
+
+`profile = 用途`。它由 `--profile` 决定，并同时驱动四件事，两项用途互不干扰：
+
+| 维度 | capture（开播） | player（播放） |
+| - | - | - |
+| 锁定文件 | `config/capture_deps.json` | `config/player_deps.json` |
+| 参与构建的库 | 8 个（含 openssl/srt/fdk-aac/openh264/libyuv） | 3 个（ffmpeg / json / spdlog） |
+| ffmpeg 外部库开关 | `--enable-openssl --enable-libsrt --enable-libfdk-aac --enable-libopenh264`（**来自锁定文件 `ffmpeg_deps` 组的 `ffmpeg_flag`**，非硬编码） | 无（ffmpeg_deps 组为空 → 不带任何 `--enable-*`，也不用先编这些库） |
+| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台硬编 / nvenc）、封装 `flv,mpegts`、协议 `file,tcp,tls,rtmp,rtmps,srt` | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,mp4,flv,mkv,mpegts,hls`、协议 `file,http,tcp,hls` |
+
+```bash
+python build.py list --profile player                          # 只看播放链路的库与白名单
+python build.py build --platform windows --profile player -o D:/work/3rd-player --libs ffmpeg
+```
+
+隔离措施（避免两项用途互相污染）：
+
+* **中间临时文件全部带 profile 标记**，便于区分与对照：
+  `build/<profile>-<platform>-<abi>/<lib>/`（编译中间产物 + `install` 暂存）、
+  `build/<profile>-logs/`（构建日志）、`.cache/<profile>/`（下载包）。
+  capture 与 player 的 `configure` 开关不同，复用同一目录会串用旧的 `config.h`/目标文件。
+  源码目录 `sources/<lib>` 两个 profile 共用（同一 URL+commit 不重复克隆；锁定值变了会自动重新拉取）。
+* **产物目录**不区分 profile（`<lib>/<platform>/<abi>`），所以不同 profile **必须用不同 `-o`**；
+  `build` 会在输出根写 `.build_profile` 记录归属，若与当前 profile 不一致直接报错并提示换目录。
+* ffmpeg 的版本标记文件名带 profile：`version-ffmpeg-6.1.6-g…-…-…windows.x64.player.msvc.txt`。
+
+补充：player 目前没有 openssl，因此协议只开到 `http`/`hls`；
+若播放器需要 https/tls，把 `openssl` 加进 `config/player_deps.json` 的 `ffmpeg_deps` 组即可，
+`--enable-openssl` 会由 `ffmpeg_flag` 自动带上。
+
 ## 2. 产物输出目录（必填）
 
 `build` / `clean` 这类会往磁盘写产物的命令**必须**给出输出目录，二选一：
@@ -81,7 +175,19 @@ TGCapture3rd/
 └── */ios/...                       # iOS 为 fat 库，不带 abi 层
 ```
 
-每个库目录下有 `version.txt`（版本、平台、构建时间、源码路径），便于追溯。
+每个库目录下会生成一个**带完整信息的版本标记文件**，便于追溯：
+
+```
+version-<库>-<版本>-g<commit>-<构建时间>.<平台>[.<abi>].<编译器>.txt
+
+version-ffmpeg-6.1.6-g1a2b3c4-2026-10-19-10-32.windows.x64.msvc.txt
+version-spdlog-v1.14.1-g9cca280a4-2026-10-19-11-05.android.arm64-v8a.ndk-clang.txt
+version-libyuv-0b9e5c92-2026-10-19-11-05.ios.xcode-clang.txt       # 归档源码无 commit、iOS 无 abi
+```
+
+* `-g<commit>`：源码目录的短 commit（7 位）；源码是压缩包（openssl/srt/fdk-aac/openh264/json）时省略
+* 编译器标识：`msvc` / `mingw` / `ndk-clang` / `xcode-clang` / `ohos-clang`
+* 文件内容同时记录 版本、commit、平台与 ABI、编译器、构建时间、构建主机、源码路径
 
 ## 3. 使用攻略
 

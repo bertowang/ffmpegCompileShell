@@ -140,6 +140,8 @@ class Toolchain:
         self.ctx = ctx
         self.logger = ctx.logger
         self.runner = ctx.runner
+        # 写入版本文件名（version-<库>-<版本>-g<commit>-<时间>.<平台>.<编译器>.txt）
+        self.compiler_id = "unknown"
 
     # 生命周期
     def prepare(self) -> None:
@@ -196,6 +198,7 @@ class WindowsToolchain(Toolchain):
     def __init__(self, ctx, prefer: str = "auto"):
         super().__init__(ctx)
         self.prefer = prefer
+        self.compiler_id = "msvc"          # prepare() 中按实际探测结果修正
         self.msvc: Optional[MSVC] = None
         self.msys2_root: Optional[Path] = None
         self.msys2_bins: List[str] = []
@@ -206,8 +209,11 @@ class WindowsToolchain(Toolchain):
         if self.prefer in ("auto", "msvc"):
             self.msvc = MSVC.discover(self.logger)
         if self.msvc:
+            self.compiler_id = "msvc"
             self.logger.info(f"MSVC: {self.msvc.install} (cl={which('cl', self.msvc.env)})")
-        elif self.prefer == "msvc":
+        else:
+            self.compiler_id = "mingw"
+        if not self.msvc and self.prefer == "msvc":
             raise ToolchainError("MSVC", "未检测到 VS / VS Build Tools",
                                  "python build.py bootstrap --platform windows --install")
         elif not (which("gcc") or (self.msys2_root and (self.msys2_root / "mingw64" / "bin" / "gcc.exe").exists())):
@@ -323,6 +329,7 @@ class AndroidToolchain(Toolchain):
         super().__init__(ctx)
         self.ndk: Optional[Path] = None
         self.ndk_hint = ndk
+        self.compiler_id = "ndk-clang"
         self.api = int(api or 21)
         self.host_tag = NDK_HOST.get(platform_mod.system(), "linux-x86_64")
 
@@ -405,6 +412,7 @@ class IOSToolchain(Toolchain):
     def __init__(self, ctx, min_version: str = "12.0"):
         super().__init__(ctx)
         self.min_version = min_version or self.default_ios_min
+        self.compiler_id = "xcode-clang"
         self._sdk: Dict[str, str] = {}
 
     def prepare(self) -> None:
@@ -516,6 +524,7 @@ class OHOSToolchain(Toolchain):
     def __init__(self, ctx, sdk: Optional[str] = None):
         super().__init__(ctx)
         self.sdk_hint = sdk
+        self.compiler_id = "ohos-clang"
         self.sdk: Optional[Path] = None
         self.cmake_bin = ""
         self.ninja = ""

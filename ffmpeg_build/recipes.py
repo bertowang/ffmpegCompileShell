@@ -333,9 +333,13 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     ctx.logger.debug(f"PKG_CONFIG_PATH={pkg_config_path}")
 
     # PKG_CONFIG_PATH 必须在 shell 内 export：外部传入会被 MSYS 做路径转换而失效
-    script = (f"export PKG_CONFIG_PATH='{pkg_config_path}' && ./configure "
+    # 必须**源码外**构建：ffmpeg 是 in-source 编译，两个 profile 共用 sources/ffmpeg 时
+    # 会互相踩到对方的 config.h 与 .o（曾出现 player 链接到 capture 的 random_seed.o、
+    # 报 RAND_bytes 未解析）。放到 <profile>-<platform>-<abi>/ffmpeg/build 里各自独立。
+    build_dir = ensure_dir(ctx.work_dir("ffmpeg", abi) / "build")
+    script = (f"export PKG_CONFIG_PATH='{pkg_config_path}' && {to_path(src / 'configure')} "
               + " ".join(args) + f" && make -j{ctx.jobs} && make install")
-    ctx.toolchain.sh(script, cwd=src, abi=abi, env=env, log_name=f"ffmpeg-{abi}")
+    ctx.toolchain.sh(script, cwd=build_dir, abi=abi, env=env, log_name=f"ffmpeg-{abi}")
 
     if ctx.platform == "windows":
         # MSVC 下 import lib 装在 bin/，同步一份到 lib/
@@ -346,10 +350,12 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     return stage
 
 
-FFMPEG_DEPENDENCIES = ("openssl", "fdk-aac", "openh264", "srt")
+FFMPEG_DEPENDENCIES = C.FFMPEG_DEPENDENCIES   # 来自锁定文件的 ffmpeg_deps 组（player 为空）
 
 
 def _dependency_prefixes(ctx, abi) -> List[Path]:
+    if not FFMPEG_DEPENDENCIES:      # 播放链路：ffmpeg 不带任何外部库
+        return []
     ready, missing = [], []
     for name in FFMPEG_DEPENDENCIES:
         prefix = ctx.install_dir(name, abi)
@@ -365,9 +371,12 @@ def _dependency_prefixes(ctx, abi) -> List[Path]:
 
 
 def _ffmpeg_common_args(ctx, abi, stage: Path, prefixes) -> List[str]:
-    encoders = list(C.BASE_ENCODERS) + C.PLATFORM_ENCODERS.get(ctx.platform, [])
-    if ctx.enable_nvenc and ctx.platform == "windows":
-        encoders.append("h264_nvenc")
+    wl = C.whitelist(getattr(ctx, "profile", ""))
+    encoders = C.whitelist_encoders(ctx.platform, ctx.enable_nvenc, getattr(ctx, "profile", ""))
+
+    def enable(option: str, key: str, values=None) -> List[str]:
+        items = list(values) if values is not None else list(wl.get(key) or [])
+        return [f"--enable-{option}={','.join(items)}"] if items else []
 
     includes = " ".join(f"-I{p}/include" for p in prefixes)
     if ctx.platform == "windows":
@@ -380,19 +389,19 @@ def _ffmpeg_common_args(ctx, abi, stage: Path, prefixes) -> List[str]:
     return [
         f"--prefix='{to_path(stage)}'",
         "--pkg-config-flags=--static",
-        # 组件白名单
+        # 组件白名单（按 profile：capture 编码+推流 / player 解码+渲染）
         "--disable-everything",
         "--disable-autodetect",
-        f"--enable-encoder={','.join(encoders)}",
-        f"--enable-decoder={','.join(C.DECODERS)}",
-        f"--enable-muxer={','.join(C.MUXERS)}",
-        f"--enable-demuxer={','.join(C.DEMUXERS)}",
-        f"--enable-parser={','.join(C.PARSERS)}",
-        f"--enable-bsf={','.join(C.BITSTREAM_FILTERS)}",
-        f"--enable-filter={','.join(C.FILTERS)}",
-        f"--enable-protocol={','.join(C.PROTOCOLS)}",
-        # 外部库
-        "--enable-openssl", "--enable-libfdk-aac", "--enable-libopenh264", "--enable-libsrt",
+        *enable("encoder", "encoders", encoders),
+        *enable("decoder", "decoders"),
+        *enable("muxer", "muxers"),
+        *enable("demuxer", "demuxers"),
+        *enable("parser", "parsers"),
+        *enable("bsf", "bsfs"),
+        *enable("filter", "filters"),
+        *enable("protocol", "protocols"),
+        # 外部库：开关来自锁定文件 ffmpeg_deps 组的 ffmpeg_flag（player 为空）
+        *C.FFMPEG_DEP_FLAGS,
         "--enable-nonfree", "--enable-version3",
         # 关掉用不到的部分
         # 注：保留 programs（ffmpeg/ffprobe CLI）用于验证产物可用性，

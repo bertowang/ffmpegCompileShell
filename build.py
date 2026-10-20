@@ -15,7 +15,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ffmpeg_build.cli import main  # noqa: E402
+try:
+    from ffmpeg_build.cli import main  # noqa: E402
+except RuntimeError as exc:                     # 依赖锁定文件缺失/路径不对
+    print(f"[配置错误] {exc}", file=sys.stderr)
+    raise SystemExit(2)
 
 if __name__ == "__main__":
     sys.exit(main())

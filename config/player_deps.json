@@ -1,0 +1,74 @@
+{
+  "schema": 2,
+  "profile": "player",
+  "updated": "2026-10-19",
+  "description": "播放(player)依赖锁定文件（示例骨架）：只列播放器需要的库——ffmpeg 6.1.6 + json + spdlog，不含开播侧的 openssl/srt/fdk-aac/openh264/libyuv。给定本文件即可复现出完全相同的目标库；升级版本只需改这里。",
+  "rules": {
+    "internal": "ffmpeg 使用内网仓库 https://git.woa.com/EST/media/e-ffmpeg/<name>.git",
+    "others": "其余库使用上游官方仓库，取截止 updated 日期的最新正式发布版（release tag）；为兼容 MediaX 时锁旧版并在 note 中说明"
+  },
+  "groups": {
+    "ffmpeg": {
+      "description": "播放器 FFmpeg 源码：解协议/解封装 → 解码 → 渲染；产物用 profile=player 标记，与开播产物区分",
+      "build_input_of": null,
+      "profiles": {
+        "player": {
+          "enabled": true,
+          "description": "播放链路示例：与开播共用 ffmpeg 6.1.6 同一 commit，裁剪白名单另配（以解码器为主，不配编码器）",
+          "libraries": {
+            "ffmpeg": {
+              "kind": "git",
+              "version": "6.1.6",
+              "profile": "player",
+              "homepage": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6",
+              "url": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6.git",
+              "tag": "",
+              "ref": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1",
+              "commit": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1",
+              "internal": true,
+              "platform_overrides": {
+                "ohos": {
+                  "kind": "git",
+                  "version": "ohos-n6.1.2_dev",
+                  "url": "https://gitee.com/openharmony-tpc-incubate/FFmpeg.git",
+                  "tag": "",
+                  "ref": "ohos-n6.1.2_dev",
+                  "commit": "",
+                  "note": "OHOS 需 openharmony-tpc 的 fork（--enable-ohosavcodecdecoder 仅该分支有）"
+                }
+              },
+              "note": "示例文件：ffmpeg 配方当前仍是开播开关（--enable-openssl/libfdk-aac/libopenh264/libsrt）与开播白名单，播放器真正开编前需先补 player 的裁剪白名单与 configure 开关"
+            }
+          }
+        }
+      }
+    },
+
+    "standalone": {
+      "description": "与 FFmpeg 无关的独立库：不参与 FFmpeg 构建，由应用直接链接（或 header-only 直接包含）",
+      "build_input_of": null,
+      "libraries": {
+        "json": {
+          "kind": "archive",
+          "version": "3.12.0",
+          "homepage": "https://github.com/nlohmann/json",
+          "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/include.zip",
+          "tag": "v3.12.0",
+          "commit": "55f93686c01528224f448c19128836e7df245f72",
+          "strip_components": 0,
+          "sha256": ""
+        },
+        "spdlog": {
+          "kind": "git",
+          "version": "v1.14.1",
+          "homepage": "https://github.com/gabime/spdlog",
+          "url": "https://github.com/gabime/spdlog.git",
+          "tag": "v1.14.1",
+          "ref": "27cb4c76708608465c413f6d0e6b8d99a4d84302",
+          "commit": "27cb4c76708608465c413f6d0e6b8d99a4d84302",
+          "note": "锁 v1.14.1：MediaX 的 find_package(spdlog 1.14.1 REQUIRED) 与 ESLogger 基于此版本（上游最新 v1.17.0，升级需同步改 MediaX 侧）"
+        }
+      }
+    }
+  }
+}

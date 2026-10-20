@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .deps_env import active_profile, deps_file  # 先于 DEPS_FILE 解析出锁定文件路径
 from .utils import ArchiveSource, CommandRunner, GitSource, Logger, SourceManager, cpu_count
 
 # ----------------------------------------------------------------- 路径约定
@@ -23,32 +25,151 @@ CACHE_DIR = ".cache"
 TOOLS_DIR = "tools"
 
 # ----------------------------------------------------------------- 源码仓库
-FFMPEG_REPO = "git@git.woa.com:EST/media/e-ffmpeg/ffmpeg-6.1.6.git"
+# 所有依赖的「地址 / 版本 / commit」统一锁定在 config/<profile>_deps.json：
+# 只要确定该文件，任何时候都能编出完全相同的目标库（升级版本只改锁定文件）。
+# 文件位置由 deps_env 解析：--deps > --profile/FFMPEG_3RD_PROFILE > --config-dir，
+# 默认 config/capture_deps.json（开播）；播放将来用 config/player_deps.json。
+DEPS_FILE = deps_file()
+ACTIVE_PROFILE = active_profile()
+FFMPEG_REPO = "git@git.woa.com:EST/media/e-ffmpeg/ffmpeg-6.1.6.git"   # 兼容旧引用
 FFMPEG_REF = "master"
 
+
+def _load_deps() -> dict:
+    if not DEPS_FILE.exists():
+        raise RuntimeError(
+            f"缺少依赖锁定文件: {DEPS_FILE}\n"
+            f"  当前 profile={ACTIVE_PROFILE}；用 --config-dir <目录> / --profile <名称> / --deps <文件> 指定，"
+            f"或设置环境变量 FFMPEG_3RD_CONFIG_DIR / FFMPEG_3RD_PROFILE / FFMPEG_3RD_DEPS")
+    with DEPS_FILE.open(encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+DEPS = _load_deps()
+
+
+def _iter_deps():
+    """按 groups → [profiles] → libraries 展开，返回 (group, profile, name, spec)。"""
+    for group_name, group in DEPS.get("groups", {}).items():
+        profiles = group.get("profiles")
+        if profiles:
+            for profile_name, profile in profiles.items():
+                if not profile.get("enabled", True):
+                    continue
+                for name, spec in profile.get("libraries", {}).items():
+                    yield group_name, profile_name, name, spec
+        else:
+            for name, spec in group.get("libraries", {}).items():
+                yield group_name, "", name, spec
+
+
+# 扁平索引：库名 -> (group, profile, spec)
+DEPS_INDEX: Dict[str, tuple] = {name: (g, p, spec) for g, p, name, spec in _iter_deps()}
+DEPS_LIBRARIES: Dict[str, dict] = {name: spec for name, (_, _, spec) in DEPS_INDEX.items()}
+
+
+def dep(name: str) -> dict:
+    try:
+        return DEPS_LIBRARIES[name]
+    except KeyError:
+        raise RuntimeError(f"{DEPS_FILE.name} 缺少库定义: {name}") from None
+
+
+def dep_group(name: str) -> str:
+    """所在分组：ffmpeg / ffmpeg_deps / standalone。"""
+    return DEPS_INDEX[name][0] if name in DEPS_INDEX else ""
+
+
+def dep_profile(name: str) -> str:
+    """用途标记（capture/player），无 profile 的库返回空串。"""
+    return DEPS_INDEX[name][1] if name in DEPS_INDEX else ""
+
+
+def _source_for(spec: dict):
+    """按锁定文件条目构造源码描述：git 优先用 commit 锁定，其次 ref/tag。"""
+    if spec.get("kind") == "git":
+        return GitSource(spec["url"],
+                         ref=spec.get("ref") or spec.get("tag") or "master",
+                         commit=spec.get("commit") or None)
+    return ArchiveSource(spec["url"],
+                         strip_components=int(spec.get("strip_components", 1)),
+                         sha256=spec.get("sha256") or None)
+
+
+def dep_source(name: str):
+    return _source_for(dep(name))
+
+
 # OHOS 官方 ffmpeg 没有 OpenHarmony 媒体框架适配，故该平台改用 openharmony-tpc 的 fork
-# （--enable-ohosavcodecdecoder 只有这个 fork 才有）
+# （--enable-ohosavcodecdecoder 只有这个 fork 才有），配置见锁定文件的 platform_overrides
 FFMPEG_PLATFORM_SOURCE: Dict[str, object] = {
-    "ohos": GitSource("https://gitee.com/openharmony-tpc-incubate/FFmpeg.git", ref="ohos-n6.1.2_dev"),
+    platform: _source_for(spec)
+    for platform, spec in ((DEPS_LIBRARIES.get("ffmpeg") or {}).get("platform_overrides") or {}).items()
 }
 # OHOS 平台追加的 ffmpeg 开关；改用官方 ffmpeg 源码时把这里置空
 OHOS_FFMPEG_EXTRA_ARGS: List[str] = ["--enable-ohosavcodecdecoder"]
 
 # ------------------------------------------------------- ffmpeg 裁剪白名单
-# 开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)，其余组件全部裁掉
-BASE_ENCODERS = ["libopenh264", "libfdk_aac", "aac"]
-PLATFORM_ENCODERS: Dict[str, List[str]] = {
-    "windows": [],
-    "android": ["h264_mediacodec"],
-    "ios": ["h264_videotoolbox"],
+# 裁剪白名单按 profile 分组：开播要编码+封装+推流，播放要解封装+解码+渲染，
+# 两者组件集不同，因此不能共用一份。--profile 决定用哪一份。
+CAPTURE_WHITELIST: Dict[str, object] = {
+    "description": "开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)，其余组件全部裁掉",
+    # 开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)
+    "encoders": ["libopenh264", "libfdk_aac", "aac"],
+    "platform_encoders": {"windows": [], "android": ["h264_mediacodec"], "ios": ["h264_videotoolbox"]},
+    "decoders": ["h264", "aac", "png"],
+    "muxers": ["flv", "mpegts"],
+    "demuxers": ["mov", "flv", "mp4"],
+    "parsers": ["h264", "aac"],
+    "bsfs": ["h264_mp4toannexb", "aac_adtstoasc", "null"],
+    "filters": ["null", "anull", "format", "aformat", "scale", "aresample", "overlay"],
+    "protocols": ["file", "tcp", "tls", "rtmp", "rtmps", "srt"],
 }
-DECODERS = ["h264", "aac", "png"]
-MUXERS = ["flv", "mpegts"]
-DEMUXERS = ["mov", "flv", "mp4"]
-PARSERS = ["h264", "aac"]
-BITSTREAM_FILTERS = ["h264_mp4toannexb", "aac_adtstoasc", "null"]
-FILTERS = ["null", "anull", "format", "aformat", "scale", "aresample", "overlay"]
-PROTOCOLS = ["file", "tcp", "tls", "rtmp", "rtmps", "srt"]
+
+PLAYER_WHITELIST: Dict[str, object] = {
+    "description": "播放 = 解协议/解封装 → 解码 → 渲染；不编任何编码器与封装器",
+    # 播放器不编码，故 encoders 为空（不生成 --enable-encoder）
+    "encoders": [],
+    "platform_encoders": {},
+    "decoders": ["h264", "hevc", "aac", "mp3", "png", "mjpeg"],
+    "muxers": [],
+    "demuxers": ["mov", "mp4", "flv", "mkv", "mpegts", "hls"],
+    "parsers": ["h264", "hevc", "aac", "mpegaudio"],
+    "bsfs": ["h264_mp4toannexb", "hevc_mp4toannexb", "aac_adtstoasc", "null"],
+    "filters": ["null", "anull", "format", "aformat", "scale", "aresample", "rotate", "transpose"],
+    # 无 openssl 时不能开 https/tls；需要 https 就把 openssl 加进 player_deps.json 的 ffmpeg_deps 组
+    "protocols": ["file", "http", "tcp", "hls"],
+}
+
+PROFILE_WHITELIST: Dict[str, Dict[str, object]] = {
+    "capture": CAPTURE_WHITELIST,
+    "player": PLAYER_WHITELIST,
+}
+DEFAULT_WHITELIST_PROFILE = "capture"
+
+# 兼容旧引用（开播语义）
+BASE_ENCODERS = CAPTURE_WHITELIST["encoders"]
+PLATFORM_ENCODERS: Dict[str, List[str]] = CAPTURE_WHITELIST["platform_encoders"]
+DECODERS = CAPTURE_WHITELIST["decoders"]
+MUXERS = CAPTURE_WHITELIST["muxers"]
+DEMUXERS = CAPTURE_WHITELIST["demuxers"]
+PARSERS = CAPTURE_WHITELIST["parsers"]
+BITSTREAM_FILTERS = CAPTURE_WHITELIST["bsfs"]
+FILTERS = CAPTURE_WHITELIST["filters"]
+PROTOCOLS = CAPTURE_WHITELIST["protocols"]
+
+
+def whitelist(profile: str = "") -> Dict[str, object]:
+    """取指定 profile 的裁剪白名单；未知 profile 回落到开播。"""
+    return PROFILE_WHITELIST.get(profile or ACTIVE_PROFILE, CAPTURE_WHITELIST)
+
+
+def whitelist_encoders(platform: str, nvenc: bool = False, profile: str = "") -> List[str]:
+    wl = whitelist(profile)
+    encoders = list(wl["encoders"]) + list(wl["platform_encoders"].get(platform, []))
+    if nvenc and platform == "windows":
+        encoders.append("h264_nvenc")
+    return encoders
 
 
 @dataclass(frozen=True)
@@ -59,59 +180,43 @@ class Library:
     summary: str
 
 
-LIBRARIES: Dict[str, Library] = {
-    "openssl": Library(
-        "openssl", "3.2.4",
-        ArchiveSource("https://github.com/openssl/openssl/releases/download/openssl-3.2.4/openssl-3.2.4.tar.gz"),
-        "TLS/HTTPS/RTMPS（已按 RTMPS 场景裁剪）",
-    ),
-    "srt": Library(
-        "srt", "v1.5.4",
-        ArchiveSource("https://github.com/Haivision/srt/archive/refs/tags/v1.5.4.tar.gz"),
-        "SRT 推流协议（ffmpeg --enable-libsrt）",
-    ),
-    "fdk-aac": Library(
-        "fdk-aac", "2.0.3",
-        ArchiveSource("https://github.com/mstorsjo/fdk-aac/archive/refs/tags/v2.0.3.tar.gz"),
-        "AAC 音频软编码",
-    ),
-    "openh264": Library(
-        "openh264", "2.3.1",
-        ArchiveSource("https://github.com/cisco/openh264/archive/refs/tags/v2.3.1.tar.gz"),
-        "H.264 视频软编码（不使用 x264/x265/v265）",
-    ),
-    "libyuv": Library(
-        "libyuv", "0b9e5c92",
-        GitSource("https://chromium.googlesource.com/libyuv/libyuv",
-                  commit="0b9e5c922deec7c9921ae385f6242a9a27754d6e"),
-        "YUV/RGB 格式转换与缩放",
-    ),
-    "json": Library(
-        "json", "3.11.3",
-        ArchiveSource("https://github.com/nlohmann/json/releases/download/v3.11.3/include.zip",
-                      strip_components=0),
-        "nlohmann/json 配置解析（header-only）",
-    ),
+# 说明：version / 源码地址 / commit 全部来自锁定文件 config/<profile>_deps.json，这里只保留用途描述。
+# 锁定文件里没列的库不会出现在这里（例如 player 只有 ffmpeg/json/spdlog），
+# 换 profile 即换一组库，无需改代码。
+_LIBRARY_SUMMARY: Dict[str, str] = {
+    "openssl": "TLS/HTTPS/RTMPS（已按 RTMPS 场景裁剪）",
+    "srt": "SRT 推流协议（ffmpeg --enable-libsrt）",
+    "fdk-aac": "AAC 音频软编码",
+    "openh264": "H.264 视频软编码（不使用 x264/x265/v265）",
+    "libyuv": "YUV/RGB 格式转换与缩放",
+    "json": "nlohmann/json 配置解析（header-only）",
     # MediaX 的 ESLogger 直接基于 spdlog 实现（android_sink / msvc_sink / OHOS hilog），
-    # 版本必须与其 find_package(spdlog 1.14.1 REQUIRED) 一致
-    "spdlog": Library(
-        "spdlog", "v1.14.1",
-        GitSource("https://github.com/gabime/spdlog.git", ref="v1.14.1"),
-        "C++ 日志库（MediaX/ESLogger 的日志实现；TGCapture 自带 Logger，可不链）",
-    ),
-    "ffmpeg": Library(
-        "ffmpeg", "6.1.6",
-        GitSource(FFMPEG_REPO, ref=FFMPEG_REF),
-        "封装 + 协议（开播链路白名单裁剪）",
-    ),
+    # 其 find_package(spdlog 1.14.1 REQUIRED) 会限制这里能升到的版本
+    "spdlog": "C++ 日志库（MediaX/ESLogger 的日志实现；TGCapture 自带 Logger，可不链）",
+    "ffmpeg": "封装 + 协议（按 profile 的裁剪白名单）",
 }
 
-# 开播工程必须要的库（被依赖方在前，ffmpeg 最后）
-BUILD_ORDER = ("openssl", "srt", "fdk-aac", "openh264", "libyuv", "ffmpeg")
+LIBRARIES: Dict[str, Library] = {
+    name: Library(name, dep(name)["version"], dep_source(name), _LIBRARY_SUMMARY[name])
+    for name in _LIBRARY_SUMMARY if name in DEPS_LIBRARIES
+}
+
+# 必须要的库（被依赖方在前，ffmpeg 最后）；只取当前锁定文件里存在的
+_ALL_BUILD_ORDER = ("openssl", "srt", "fdk-aac", "openh264", "libyuv", "ffmpeg")
 # 默认不构建：json 是 header-only（MediaX 侧通常已由 3rd submodule 提供），
 # spdlog 只有 MediaX 的 ESLogger 需要（TGCapture 自带 Logger），均按需 --libs xxx
-OPTIONAL_LIBRARIES = ("json", "spdlog")
+_ALL_OPTIONAL = ("json", "spdlog")
+
+BUILD_ORDER = tuple(n for n in _ALL_BUILD_ORDER if n in LIBRARIES)
+OPTIONAL_LIBRARIES = tuple(n for n in _ALL_OPTIONAL if n in LIBRARIES)
 DEFAULT_SELECTION = BUILD_ORDER
+
+# ffmpeg 的外部库依赖与对应 configure 开关，全部来自锁定文件的 ffmpeg_deps 组：
+# 开播组里有 openssl/srt/fdk-aac/openh264 → --enable-openssl/--enable-libsrt/...；
+# 播放组为空 → 不带任何 --enable-*，也就不需要先编这些库。
+FFMPEG_DEPENDENCIES: tuple = tuple(n for n in _ALL_BUILD_ORDER if dep_group(n) == "ffmpeg_deps")
+FFMPEG_DEP_FLAGS: List[str] = [spec["ffmpeg_flag"] for n in FFMPEG_DEPENDENCIES
+                               for spec in [DEPS_LIBRARIES[n]] if spec.get("ffmpeg_flag")]
 
 
 def resolve_selection(selection: Optional[str]) -> List[str]:
@@ -138,6 +243,7 @@ class BuildContext:
     ffmpeg_ref: str = FFMPEG_REF
     ffmpeg_lto: bool = False
     enable_nvenc: bool = False
+    profile: str = ACTIVE_PROFILE     # 用途（capture/player）：决定白名单、外部库开关、中间目录
 
     toolchain: object = None          # 由 cli 装配
     logger: Logger = field(default_factory=Logger)
@@ -148,7 +254,7 @@ class BuildContext:
         self.output_root = Path(self.output_root)
         if self.jobs <= 0:
             self.jobs = cpu_count()
-        self.runner.log_dir = self.build_root / "logs"
+        self.runner.log_dir = self.log_root
         self.sources = SourceManager(self.runner, self.logger, self.cache_root)
 
     # 路径
@@ -166,13 +272,23 @@ class BuildContext:
 
     @property
     def cache_root(self) -> Path:
-        return PROJECT_ROOT / CACHE_DIR
+        # 按 profile 分开：下载包按 URL 命名，两个 profile 可能锁不同版本的同名包
+        return PROJECT_ROOT / CACHE_DIR / self.profile
+
+    @property
+    def log_root(self) -> Path:
+        # 日志也按 profile 分开，便于对照排错（同名日志不会被另一用途追加覆盖）
+        return self.build_root / f"{self.profile}-logs"
 
     def source_dir(self, lib: str) -> Path:
+        # 源码目录两个 profile 共用：同一 URL+commit 不必重复克隆；
+        # 锁定值不同时由 .deps_pin 触发重新拉取，不会误用旧源码
         return self.source_root / lib
 
     def work_dir(self, lib: str, abi: str) -> Path:
-        return self.build_root / f"{self.platform}-{abi}" / lib
+        # 带 profile 前缀：capture 与 player 的 configure 开关不同，
+        # 共用一个中间目录会互相污染（复用旧 config.h/目标文件）
+        return self.build_root / f"{self.profile}-{self.platform}-{abi}" / lib
 
     def stage_dir(self, lib: str, abi: str) -> Path:
         return self.work_dir(lib, abi) / "install"

@@ -1,0 +1,135 @@
+{
+  "schema": 2,
+  "profile": "capture",
+  "updated": "2026-10-19",
+  "description": "开播(capture)专用的依赖锁定文件：固定每个库的来源地址、版本与 commit。给定本文件即可复现出完全相同的目标库；升级版本只需改这里。",
+  "rules": {
+    "internal": "ffmpeg、fdk-aac 使用内网仓库 https://git.woa.com/EST/media/e-ffmpeg/<name>.git",
+    "others": "其余库使用上游官方仓库，取截止 updated 日期的最新正式发布版（release tag）；为兼容 MediaX 时锁旧版并在 note 中说明"
+  },
+  "groups": {
+    "ffmpeg": {
+      "description": "FFmpeg 自身源码。本文件只描述开播(capture)用途；产物用 profile=capture 标记区分",
+      "build_input_of": null,
+      "profiles": {
+        "capture": {
+          "enabled": true,
+          "description": "开播链路：采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)；裁剪白名单见 ffmpeg_build/config.py",
+          "libraries": {
+            "ffmpeg": {
+              "kind": "git",
+              "version": "6.1.6",
+              "profile": "capture",
+              "homepage": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6",
+              "url": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6.git",
+              "tag": "",
+              "ref": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1",
+              "commit": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1",
+              "internal": true,
+              "platform_overrides": {
+                "ohos": {
+                  "kind": "git",
+                  "version": "ohos-n6.1.2_dev",
+                  "url": "https://gitee.com/openharmony-tpc-incubate/FFmpeg.git",
+                  "tag": "",
+                  "ref": "ohos-n6.1.2_dev",
+                  "commit": "",
+                  "note": "OHOS 需 openharmony-tpc 的 fork（--enable-ohosavcodecdecoder 仅该分支有）"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "ffmpeg_deps": {
+      "description": "FFmpeg 的构建期依赖：configure 需对应 --enable-*，产物静态并入 avcodec/avformat。Windows 上应用无需再链；Android 为独立 .so，需随包并显式链接",
+      "build_input_of": "ffmpeg",
+      "libraries": {
+        "openssl": {
+          "kind": "archive",
+          "version": "3.6.5",
+          "homepage": "https://github.com/openssl/openssl",
+          "url": "https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz",
+          "tag": "openssl-3.6.5",
+          "commit": "c8bd5a57108599ac650bbae77fcabe3109dab2e8",
+          "strip_components": 1,
+          "sha256": "",
+          "ffmpeg_flag": "--enable-openssl"
+        },
+        "srt": {
+          "kind": "archive",
+          "version": "1.5.7",
+          "homepage": "https://github.com/Haivision/srt",
+          "url": "https://github.com/Haivision/srt/archive/refs/tags/v1.5.7.tar.gz",
+          "tag": "v1.5.7",
+          "commit": "899348d8318eb9a3c5a5b6ec43c4a1114288773a",
+          "strip_components": 1,
+          "sha256": "",
+          "ffmpeg_flag": "--enable-libsrt"
+        },
+        "fdk-aac": {
+          "kind": "git",
+          "version": "2.0.3",
+          "homepage": "https://git.woa.com/EST/media/e-ffmpeg/fdk_aac_v2.0.3",
+          "url": "https://git.woa.com/EST/media/e-ffmpeg/fdk_aac_v2.0.3.git",
+          "tag": "",
+          "ref": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
+          "commit": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
+          "internal": true,
+          "ffmpeg_flag": "--enable-libfdk-aac",
+          "note": "用内网 fdk_aac_v2.0.3（与 FFmpeg 6.1 的 libfdk-aac wrapper 匹配；上游 v3.0.0 为大版本跨越，暂不升级）"
+        },
+        "openh264": {
+          "kind": "archive",
+          "version": "2.6.0",
+          "homepage": "https://github.com/cisco/openh264",
+          "url": "https://github.com/cisco/openh264/archive/refs/tags/v2.6.0.tar.gz",
+          "tag": "v2.6.0",
+          "commit": "652bdb7719f30b52b08e506645a7322ff1b2cc6f",
+          "strip_components": 1,
+          "sha256": "",
+          "ffmpeg_flag": "--enable-libopenh264"
+        }
+      }
+    },
+
+    "standalone": {
+      "description": "与 FFmpeg 无关的独立库：不参与 FFmpeg 构建，由应用直接链接（或 header-only 直接包含）",
+      "build_input_of": null,
+      "libraries": {
+        "libyuv": {
+          "kind": "git",
+          "version": "1974",
+          "homepage": "https://chromium.googlesource.com/libyuv/libyuv",
+          "url": "https://chromium.googlesource.com/libyuv/libyuv",
+          "tag": "",
+          "ref": "2404f9730e2e48946d29c6d28e3b630302a8d842",
+          "commit": "2404f9730e2e48946d29c6d28e3b630302a8d842",
+          "note": "libyuv 无 release tag，锁上游 HEAD；version 字段为 LIBYUV_VERSION"
+        },
+        "json": {
+          "kind": "archive",
+          "version": "3.12.0",
+          "homepage": "https://github.com/nlohmann/json",
+          "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/include.zip",
+          "tag": "v3.12.0",
+          "commit": "55f93686c01528224f448c19128836e7df245f72",
+          "strip_components": 0,
+          "sha256": ""
+        },
+        "spdlog": {
+          "kind": "git",
+          "version": "v1.14.1",
+          "homepage": "https://github.com/gabime/spdlog",
+          "url": "https://github.com/gabime/spdlog.git",
+          "tag": "v1.14.1",
+          "ref": "27cb4c76708608465c413f6d0e6b8d99a4d84302",
+          "commit": "27cb4c76708608465c413f6d0e6b8d99a4d84302",
+          "note": "锁 v1.14.1：MediaX 的 find_package(spdlog 1.14.1 REQUIRED) 与 ESLogger 基于此版本（上游最新 v1.17.0，升级需同步改 MediaX 侧）"
+        }
+      }
+    }
+  }
+}

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import urllib.request
 import zipfile
@@ -16,6 +18,23 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 
 Command = Union[str, Sequence[str]]
+
+
+def _tolerant_stdio() -> None:
+    """Windows 控制台/重定向常是 GBK，而 nmake、cl 等工具输出可能含其无法编码的字符
+    （例如 \\ufffd），直接 print 会抛 UnicodeEncodeError 让整条构建中断。
+    这里统一改成"写不出来就替换"，保证构建日志不会因为一个字符而失败。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+_tolerant_stdio()
 
 
 @dataclass(frozen=True)
@@ -238,8 +257,12 @@ class SourceManager:
     def ensure(self, spec, dest: Path, force: bool = False) -> Path:
         dest = Path(dest)
         if dest.exists() and any(dest.iterdir()) and not force:
-            self.logger.info(f"复用源码: {dest}")
-            return dest
+            if _pin_matches(dest / ".deps_pin", spec):
+                self.logger.info(f"复用源码: {dest}")
+                return dest
+            # 锁定值变了（锁定文件升级/回退），必须重新拉取才能保证可复现
+            self.logger.info(f"源码与锁定文件不一致，重新拉取: {dest}")
+            force = True
         if force and dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -264,7 +287,36 @@ class SourceManager:
             extract_archive(archive, dest, self.logger, spec.strip_components)
         else:
             raise RuntimeError(f"未知源码类型: {spec!r}")
+        _write_pin(dest / ".deps_pin", spec)
         return dest
+
+
+def _pin_of(spec) -> Dict[str, object]:
+    """把源码描述压缩成可比较的锁定信息（写入源码目录，用于校验一致性）。"""
+    if isinstance(spec, GitSource):
+        return {"kind": "git", "url": spec.url, "ref": spec.ref, "commit": spec.commit}
+    if isinstance(spec, ArchiveSource):
+        return {"kind": "archive", "url": spec.url, "sha256": spec.sha256,
+                "strip_components": spec.strip_components}
+    return {"kind": "unknown"}
+
+
+def _write_pin(marker: Path, spec) -> None:
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(_pin_of(spec), sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _pin_matches(marker: Path, spec) -> bool:
+    """源码目录的锁定标记与当前 spec 一致才允许复用。"""
+    if not marker.exists():
+        return False
+    try:
+        return json.loads(marker.read_text(encoding="utf-8")) == _pin_of(spec)
+    except (OSError, ValueError):
+        return False
 
 
 # ------------------------------------------------------------------ 杂项
@@ -326,6 +378,50 @@ def to_msys_path(path) -> str:
 def write_version_file(path: Path, lines) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def git_head_sha(src_dir) -> str:
+    """取源码目录的短 commit（7 位）；非 git 仓库/取不到时返回空串。"""
+    import subprocess
+
+    src = Path(src_dir)
+    if not (src / ".git").exists():
+        return ""
+    try:
+        result = subprocess.run(["git", "-C", str(src), "rev-parse", "--short=7", "HEAD"],
+                                capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def build_marker_name(library: str, version: str, platform: str, abi: str,
+                      compiler: str, commit: str = "", when=None, profile: str = "") -> str:
+    """版本文件名：version-<库>-<版本>-g<commit>-<时间>.<平台>[.<abi>][.<用途>].<编译器>.txt
+
+    例：
+      version-ffmpeg-6.1.6-g3c1fc5d-2026-10-19-10-32.windows.x64.capture.msvc.txt
+      version-spdlog-v1.14.1-g27cb4c7-2026-10-19-20-36.windows.x64.msvc.txt
+    """
+    import re
+    from datetime import datetime as _dt
+
+    when = when or _dt.now()
+
+    def safe(text: str) -> str:
+        return re.sub(r"[^0-9A-Za-z._-]+", "-", str(text)).strip("-") or "unknown"
+
+    parts = ["version", safe(library), safe(version)]
+    if commit:
+        parts.append("g" + safe(commit)[:9])
+    parts.append(when.strftime("%Y-%m-%d-%H-%M"))
+    tail = [safe(platform)]
+    if abi:
+        tail.append(safe(abi))
+    if profile:
+        tail.append(safe(profile))
+    tail.append(safe(compiler))
+    return ".".join(["-".join(parts), *tail]) + ".txt"
 
 
 def fix_pkgconfig_prefixes(install_dir: Path) -> None:
