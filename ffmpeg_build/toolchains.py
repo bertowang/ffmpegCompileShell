@@ -9,11 +9,12 @@ import glob
 import os
 import platform as platform_mod
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .config import PROJECT_ROOT, TOOLS_DIR
+from .config import PROJECT_ROOT, TOOLS_DIR, is_portable, platform_layout
 from .utils import copy_tree, ensure_dir, fix_pkgconfig_prefixes, lipo_create, static_lib_names, to_msys_path, which
 
 VSWHERE_CANDIDATES = [
@@ -153,10 +154,23 @@ class Toolchain:
     def cmake_args(self, abi: str) -> List[str]:
         raise NotImplementedError
 
-    # 路径
+    # 路径 / 目录布局（对齐 MediaX/ESMediaX/3rd 的历史结构）
+    def layout_of(self, lib: str) -> str:
+        layout = platform_layout(self.name, lib)
+        # flat / lib 布局没有 abi 层，同时编多个 ABI 会互相覆盖 → 回落到 abi 目录
+        if layout != "abi" and len(self.ctx.abis) > 1:
+            self.logger.info(f"[{lib}] 同时构建 {', '.join(self.ctx.abis)}，改用 abi 目录布局"
+                             f"（{layout} 布局无 abi 层会互相覆盖）")
+            return "abi"
+        return layout
+
     def install_dir(self, lib: str, abi: Optional[str] = None) -> Path:
+        if is_portable(lib):        # header-only：三端共用一份，不带平台/abi 层
+            return self.ctx.output_root / lib
         root = self.ctx.output_root / lib / self.name
-        return root / abi if self.use_abi_dir and abi else root
+        if abi and self.layout_of(lib) == "abi":
+            return root / abi
+        return root
 
     # 执行
     def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
@@ -175,15 +189,45 @@ class Toolchain:
         return requested or list(self.default_abis)
 
     def finalize(self, lib: str, stages: Dict[str, Path]) -> Path:
-        target = self.install_dir(lib, next(iter(stages)) if self.use_abi_dir else None)
+        """按布局落盘：flat 直放、lib 把 lib/* 收到 lib/<abi>/、abi 放到 <平台>/<abi>。"""
+        portable = is_portable(lib)
+        target = self.install_dir(lib, next(iter(stages)))
         for abi, stage in stages.items():
-            destination = self.install_dir(lib, abi) if self.use_abi_dir else target
+            destination = self.install_dir(lib, abi) if not portable else target
             ensure_dir(destination)
+            if portable:
+                # header-only 的目录名不固定（include / single_include / …），整份拷贝，别按名单挑；
+                # 拷贝前先清掉同名旧内容，否则换 output_subdirs 时新旧头文件会混在一起
+                for item in stage.iterdir():
+                    stale = destination / item.name
+                    if stale.is_dir():
+                        shutil.rmtree(stale, ignore_errors=True)
+                    elif stale.exists():
+                        stale.unlink()
+                copy_tree(stage, destination)
+                continue
             for sub in ("include", "lib", "bin", "share"):
                 if (stage / sub).exists():
                     copy_tree(stage / sub, destination / sub)
+            if self.layout_of(lib) == "lib":      # spdlog：abi 层放在 lib 里面
+                self._move_lib_into_abi(destination, abi)
             fix_pkgconfig_prefixes(destination)
         return target
+
+    @staticmethod
+    def _move_lib_into_abi(target: Path, abi: str) -> None:
+        """把 <target>/lib/* 挪到 <target>/lib/<abi>/*（幂等，重跑不会嵌套）。"""
+        lib_dir = target / "lib"
+        if not lib_dir.exists():
+            return
+        dest = lib_dir / abi
+        if dest.exists():
+            return
+        dest.mkdir(parents=True, exist_ok=True)
+        for entry in list(lib_dir.iterdir()):
+            if entry == dest:
+                continue
+            shutil.move(str(entry), str(dest / entry.name))
 
 
 # ------------------------------------------------------------------ Windows
@@ -198,6 +242,7 @@ class WindowsToolchain(Toolchain):
     def __init__(self, ctx, prefer: str = "auto"):
         super().__init__(ctx)
         self.prefer = prefer
+        self.crt = (getattr(ctx, "crt", "mt") or "mt").lower()
         self.compiler_id = "msvc"          # prepare() 中按实际探测结果修正
         self.msvc: Optional[MSVC] = None
         self.msys2_root: Optional[Path] = None
@@ -258,13 +303,28 @@ class WindowsToolchain(Toolchain):
             args = ["-G", self.msvc.generator, "-A", "x64"]
         args += ["-DCMAKE_BUILD_TYPE=Release"]
         if self.msvc:
-            # 与 openssl/openh264/ffmpeg 的 /MT 保持一致，否则链接报 __imp_xxx 未解析
+            # 默认 /MT，与 openssl/ffmpeg 一致（否则 ffmpeg 链接时 CRT 打架）；
+            # --crt md 给 /MD 的消费方（如 ESMediaX），典型只用于应用直链的库（spdlog/libyuv/json）
             args += [
-                "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
-                "-DCMAKE_C_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG",
-                "-DCMAKE_CXX_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG",
+                f"-DCMAKE_MSVC_RUNTIME_LIBRARY={self.crt_lib}",
+                f"-DCMAKE_C_FLAGS_RELEASE={self.crt_flag} /O2 /Ob2 /DNDEBUG",
+                f"-DCMAKE_CXX_FLAGS_RELEASE={self.crt_flag} /O2 /Ob2 /DNDEBUG",
             ]
         return args
+
+    @property
+    def crt_flag(self) -> str:
+        """/MD（动态 CRT）或 /MT（静态 CRT）。"""
+        return "/MD" if self.crt == "md" else "/MT"
+
+    @property
+    def marker_variant(self) -> str:
+        """记进版本文件名的重要信息：Windows 的 CRT（mt/md）。"""
+        return f"crt{self.crt}"
+
+    @property
+    def crt_lib(self) -> str:
+        return "MultiThreadedDLL" if self.crt == "md" else "MultiThreaded"
 
     @property
     def needs_config_type(self) -> bool:
@@ -345,6 +405,12 @@ class AndroidToolchain(Toolchain):
             raise ToolchainError("Android ABI", f"不支持: {unknown}", f"可选: {', '.join(ANDROID_ABI)}")
         self.logger.info(f"NDK: {self.ndk} (host={self.host_tag}, api={self.api})")
 
+    @property
+    def marker_variant(self) -> str:
+        """记进版本文件名的重要信息：Android API 级别（+ NDK 版本）。"""
+        ndk = getattr(self, "ndk_version", "") or ""
+        return f"api{self.api}" + (f"-ndk{ndk}" if ndk else "")
+
     def _detect_ndk(self) -> Optional[Path]:
         candidates: List[Path] = []
         if self.ndk_hint:
@@ -414,6 +480,11 @@ class IOSToolchain(Toolchain):
         self.min_version = min_version or self.default_ios_min
         self.compiler_id = "xcode-clang"
         self._sdk: Dict[str, str] = {}
+
+    @property
+    def marker_variant(self) -> str:
+        """记进版本文件名的重要信息：iOS 最低系统版本（3rd-bak 的文件名里也是这个）。"""
+        return f"min{self.min_version}"
 
     def prepare(self) -> None:
         if platform_mod.system() != "Darwin":

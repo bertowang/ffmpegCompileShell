@@ -396,12 +396,20 @@ def git_head_sha(src_dir) -> str:
 
 
 def build_marker_name(library: str, version: str, platform: str, abi: str,
-                      compiler: str, commit: str = "", when=None, profile: str = "") -> str:
-    """版本文件名：version-<库>-<版本>-g<commit>-<时间>.<平台>[.<abi>][.<用途>].<编译器>.txt
+                      compiler: str, commit: str = "", when=None, profile: str = "",
+                      variant: str = "") -> str:
+    """版本文件名：version-<abi>-<库>-<版本>-g<commit>-<时间>.<平台>[.<abi>][.<用途>].<编译器>[.<关键信息>].txt
+
+    abi 放在最前面，一眼就能看出这份产物是 x64 还是 x86（iOS 的 fat 库没有 abi 层，省略该前缀）。
+    末尾的"关键信息"按平台记最重要的构建约束：Windows=CRT(mt/md)、Android=API 级别(api21…)、
+    iOS=最低系统版本(min13.0)，与 3rd-bak 里 `ffmpeg-6.0-…-min13.0.txt` 的做法一致。
 
     例：
-      version-ffmpeg-6.1.6-g3c1fc5d-2026-10-19-10-32.windows.x64.capture.msvc.txt
-      version-spdlog-v1.14.1-g27cb4c7-2026-10-19-20-36.windows.x64.msvc.txt
+      version-x64-ffmpeg-6.1.6-g3c1fc5d-2026-10-19-22-47.windows.x64.capture.msvc.crtmt.txt
+      version-x64-spdlog-v1.14.1-g27cb4c7-2026-10-19-20-36.windows.x64.msvc.crtmd.txt
+      version-arm64-v8a-ffmpeg-6.1.6-g3c1fc5d-2026-10-20-12-10.android.arm64-v8a.capture.ndk-clang.api21.txt
+      version-ffmpeg-6.1.6-g3c1fc5d-2026-10-20-12-10.ios.capture.xcode-clang.min13.0.txt
+      version-json-3.12.0-2026-10-20-11-56.any.header-only.txt
     """
     import re
     from datetime import datetime as _dt
@@ -411,7 +419,11 @@ def build_marker_name(library: str, version: str, platform: str, abi: str,
     def safe(text: str) -> str:
         return re.sub(r"[^0-9A-Za-z._-]+", "-", str(text)).strip("-") or "unknown"
 
-    parts = ["version", safe(library), safe(version)]
+    parts = ["version"]
+    if abi:
+        parts.append(safe(abi))          # 一眼分清 x64 / x86 / arm64-v8a
+    parts.append(safe(library))
+    parts.append(safe(version))
     if commit:
         parts.append("g" + safe(commit)[:9])
     parts.append(when.strftime("%Y-%m-%d-%H-%M"))
@@ -421,6 +433,8 @@ def build_marker_name(library: str, version: str, platform: str, abi: str,
     if profile:
         tail.append(safe(profile))
     tail.append(safe(compiler))
+    if variant:
+        tail.append(safe(variant))
     return ".".join(["-".join(parts), *tail]) + ".txt"
 
 

@@ -114,9 +114,17 @@ python build.py build --platform windows --deps D:/work/capture_deps.json ...   
 | 维度 | capture（开播） | player（播放） |
 | - | - | - |
 | 锁定文件 | `config/capture_deps.json` | `config/player_deps.json` |
-| 参与构建的库 | 8 个（含 openssl/srt/fdk-aac/openh264/libyuv） | 3 个（ffmpeg / json / spdlog） |
-| ffmpeg 外部库开关 | `--enable-openssl --enable-libsrt --enable-libfdk-aac --enable-libopenh264`（**来自锁定文件 `ffmpeg_deps` 组的 `ffmpeg_flag`**，非硬编码） | 无（ffmpeg_deps 组为空 → 不带任何 `--enable-*`，也不用先编这些库） |
-| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台硬编 / nvenc）、封装 `flv,mpegts`、协议 `file,tcp,tls,rtmp,rtmps,srt` | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,mp4,flv,mkv,mpegts,hls`、协议 `file,http,tcp,hls` |
+| 参与构建的库 | 9 个（含 **zlib**/openssl/srt/fdk-aac/openh264/libyuv） | 4 个（**zlib** / ffmpeg / json / spdlog） |
+| ffmpeg 外部库开关 | `--enable-zlib --enable-openssl --enable-libsrt --enable-libfdk-aac --enable-libopenh264`（**来自锁定文件 `ffmpeg_deps` 组的 `ffmpeg_flag`**，非硬编码） | `--enable-zlib`（png 解码依赖 zlib） |
+| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台硬编 / nvenc）、封装 `flv,mpegts`、解封装含 `image2`（水印图）、协议 `file,tcp,tls,http,https,rtmp,rtmps,libsrt` | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,mp4,flv,mkv,mpegts,hls`、协议 `file,http,tcp,hls` |
+
+两个白名单细节（都是踩过坑才改的）：
+
+* 协议名要用 **`libsrt`**（协议内部名是 `libsrt`，URL scheme 才是 `srt`）；
+  写成 `srt` 会被 configure **静默忽略**，结果 `ffmpeg -protocols` 里没有 `srt`，SRT 推流不可用。
+* **`--enable-zlib` 是 png 解码器的前提**：`png_decoder_select="inflate_wrapper"` → zlib，
+  缺 zlib 时 `CONFIG_PNG_DECODER=0`，水印/logo 这类 PNG 图片解码不了（配合 `http/https` 协议 +
+  `image2` 解封装才能加载远程水印图）。
 
 ```bash
 python build.py list --profile player                          # 只看播放链路的库与白名单
@@ -137,6 +145,26 @@ python build.py build --platform windows --profile player -o D:/work/3rd-player 
 补充：player 目前没有 openssl，因此协议只开到 `http`/`hls`；
 若播放器需要 https/tls，把 `openssl` 加进 `config/player_deps.json` 的 `ffmpeg_deps` 组即可，
 `--enable-openssl` 会由 `ffmpeg_flag` 自动带上。
+
+### 1.3 Windows 运行时库 `--crt mt|md`
+
+| 取值 | 含义 | 适用 |
+| - | - | - |
+| `mt`（**默认**） | `/MT` 静态链接 CRT | 与现有产物一致：openssl/ffmpeg/CMake 库全部 `/MT`（ffmpeg 的 DLL 里不含 `MSVCR140.dll`） |
+| `md` | `/MD` 动态链接 CRT | 消费方工程是 `/MD` / `/MDd` 时（如 ESMediaX 全工程 `MultiThreadedDLL`） |
+
+```bash
+python build.py build --platform windows --crt md -o D:/work/3rd-md --libs spdlog,libyuv,json
+```
+
+* 作用域：**只对 CMake 构建的库生效**（`spdlog` / `libyuv` / `json` / `srt` / `fdk-aac` / `openh264`）；
+  `openssl` 与 `ffmpeg` 始终 `/MT`（ffmpeg 是 DLL 且为 C 接口，`/MT` 的 DLL 被 `/MD` 的 exe 加载没问题）。
+* 因此 `--crt md` **不要用来编 ffmpeg**：会把 `/MD` 的静态库链进 `/MT` 的 ffmpeg。
+  典型用法是只给「应用直接链接的库」单独出一份 `/MD`。
+* 版本标记文件里会多一行 `crt : /MD`（或 `/MT`），可据此确认这批库的 CRT。
+* 消费方报 `检测到"RuntimeLibrary"的不匹配项` 时：
+  `dumpbin /directives xxx.lib` 看 `RuntimeLibrary=MD_DynamicRelease` 还是 `MT_StaticRelease`，
+  再与工程的 `MultiThreaded`/`MultiThreadedDLL`（Debug 为 `…Debug`/`…DebugDLL`）比对。
 
 ## 2. 产物输出目录（必填）
 
@@ -160,6 +188,61 @@ ERROR 未指定产物输出目录，必须显式给出，避免产物落到预�
 ```
 
 不需要输出目录的命令（`list` / `bootstrap` / `fetch`）可省略。
+
+### 2.1 Windows 产物目录布局（对齐 `MediaX/ESMediaX/3rd`）
+
+Windows 下按 **3rd-bak 的历史结构**输出，产物可以整目录拷进 `ESMediaX/3rd` 直接替换：
+
+| 布局 | 结构 | 对应库 | 3rd-bak 里的样例 |
+| - | - | - | - |
+| `flat` | `<库>/windows/{include,lib,bin}`（**无 abi 层**） | `ffmpeg` `libyuv` `zlib` `openssl` `srt` `fdk-aac` `openh264` | `ffmpeg-capturer/windows/{bin,include,lib}`、`libyuv/windows/{bin,include,lib}` |
+| `lib` | `<库>/windows/include` + `<库>/windows/lib/<abi>` | `spdlog` | `spdlog/windows/lib/x64`、`spdlog/windows/lib/x86` |
+| `abi` | `<库>/windows/<abi>/{include,lib,bin}`（本平台默认） | 未登记的库；以及**同时编多个 ABI** 时自动回落 | — |
+
+Android / iOS / OHOS 同样以 `PLATFORM_LAYOUT` 对齐 `3rd-bak`：
+
+| 平台 | 布局 | 说明 |
+| - | - | - |
+| android | `abi`（默认）：`<库>/android/<abi>/{include,lib,bin}`；`spdlog` → `flat` | 对齐 `ffmpeg-capturer/android/arm64-v8a/{bin,include,lib,share}`、`spdlog/android/{include,lib}` |
+| ohos | 同上（`libyuv/ohos/<abi>`、`spdlog/ohos/{include,lib}`） | 对齐 3rd-bak |
+| ios | `flat` + lipo 合并：**`<库>/ios/{include,lib}`（fat，无 abi 层）** | 对齐 `ffmpeg-capturer/ios/{include,lib}`、`libyuv/ios/{include,lib}` |
+
+* 布局表在 `config.WINDOWS_LAYOUT`，加新库时登记一行即可。
+* flat / lib 布局没有 abi 层，`--abi x64,x86` 同时编会互相覆盖 → 检测到多 ABI 时自动改用 abi 目录并打印提示。
+* 其它平台（android/ohos 为 `<库>/<平台>/<abi>`，ios 为 fat 库无 abi 层）维持原样。
+
+**portable（与平台无关的库）**：header-only 的 `json` 在锁定文件里声明 `"layout": "portable"`，
+产物直接放 `<输出根>/json/…`，**不带 `<平台>`/`<abi>` 层**，三端共用一份
+（与 `ESMediaX/3rd` 里 json submodule 的布局一致）。
+输出哪些子目录由同一个条目的 `"output_subdirs"` 决定，现在只给 `single_include`——
+即 `<输出根>/json/single_include/nlohmann/json.hpp`（**合并后的单头文件**，与 `3rd-bak` 一致；
+源码里的 `include/` 是 46 个模块化头文件，需要时把 `output_subdirs` 改成 `["include","single_include"]` 即可）。
+版本标记相应写成
+`version-json-3.12.0-2026-10-20-11-52.any.header-only.txt`（平台 `any`、无 abi、编译器 `header-only`）。
+判定函数 `config.is_portable(lib)`，加新的 header-only 库只要在锁定文件里加一行 `"layout": "portable"`。
+
+### 2.2 版本标记文件名
+
+```
+version-<abi>-<库>-<版本>-g<commit>-<构建时间>.<平台>[.<abi>][.<用途>].<编译器>[.<关键信息>].txt
+例：version-x64-ffmpeg-6.1.6-g3c1fc5d-2026-10-19-22-47.windows.x64.capture.msvc.crtmt.txt
+    version-x86-spdlog-v1.14.1-g27cb4c7-2026-10-20-09-05.windows.x86.msvc.crtmd.txt
+    version-arm64-v8a-ffmpeg-6.1.6-g3c1fc5d-…android.arm64-v8a.capture.ndk-clang.api21.txt
+    version-ffmpeg-6.1.6-g3c1fc5d-….ios.capture.xcode-clang.min13.0.txt      （iOS fat 无 abi 前缀）
+    version-json-3.12.0-2026-10-20-11-56.any.header-only.txt                 （portable 库）
+```
+
+**abi 放在最前面**，一眼分清 x64 / x86 / arm64-v8a；末尾的**关键信息**按平台记最要紧的构建约束
+（与 `3rd-bak` 里 `ffmpeg-6.0-…-min13.0.txt` 的做法一致）：
+
+| 平台 | 关键信息 | 来源 |
+| - | - | - |
+| windows | `crtmt` / `crtmd` | `--crt` |
+| android | `api21`（有 NDK 版本时再带 `-ndk…`） | `--android-api` / NDK |
+| ios | `min13.0` | `--min-version` |
+| portable(header-only) | 省略 | — |
+
+文件里另有 `profile` / `group` / `crt` / `variant` / `layout` 等行。
 
 产物布局（与 `MediaX/ESMediaX/3rd/<库>/<平台>/<abi>` 一致，可直接替换）：
 

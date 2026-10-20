@@ -63,6 +63,12 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("libopenh264", capture["encoders"])
         self.assertIn("flv", capture["muxers"])
         self.assertIn("rtmp", capture["protocols"])
+        # https（拉水印/logo）与 libsrt（SRT 协议的正确内部名；写 srt 会被 configure 静默忽略）
+        self.assertIn("https", capture["protocols"])
+        self.assertIn("libsrt", capture["protocols"])
+        self.assertNotIn("srt", capture["protocols"])
+        # 图片水印要经 avformat 打开，必须有 image2 类 demuxer
+        self.assertIn("image2", capture["demuxers"])
         self.assertEqual(player["encoders"], [])          # 播放不编码 → 不生成 --enable-encoder
         self.assertEqual(player["muxers"], [])
         self.assertIn("hevc", player["decoders"])
@@ -70,13 +76,25 @@ class ConfigTest(unittest.TestCase):
         # 开播的 ffmpeg 外部库开关来自锁定文件的 ffmpeg_deps 组（不再是硬编码）
         self.assertEqual(sorted(FFMPEG_DEP_FLAGS),
                          ["--enable-libfdk-aac", "--enable-libopenh264", "--enable-libsrt",
-                          "--enable-openssl"])
+                          "--enable-openssl", "--enable-zlib"])
         # 平台编码器 + nvenc 只按 profile 追加
         self.assertIn("h264_mediacodec", whitelist_encoders("android", False, "capture"))
         self.assertEqual(whitelist_encoders("android", False, "player"), [])
         self.assertIn("h264_nvenc", whitelist_encoders("windows", True, "capture"))
         # 未知 profile 回落到开播，避免拼错时静默编出半套组件
         self.assertIs(whitelist("unknown"), capture)
+
+    def test_auto_bsfs_always_enabled(self):
+        # avformat 会自动插入 extract_extradata（flvenc 的 h264、demux 缺 extradata 时），
+        # 裁掉只在运行期报 AVERROR_BSF_NOT_FOUND，configure 看不出来 → 强制并入所有 profile
+        from ffmpeg_build.config import AUTO_BSFS, whitelist, whitelist_bsfs
+        self.assertIn("extract_extradata", AUTO_BSFS)
+        for profile in ("capture", "player"):
+            bsfs = whitelist_bsfs(profile)
+            for name in AUTO_BSFS:
+                self.assertIn(name, bsfs)
+            self.assertEqual(len(bsfs), len(set(bsfs)))       # 去重
+            self.assertGreaterEqual(set(bsfs), set(whitelist(profile)["bsfs"]))
 
     def test_work_dir_has_profile(self):
         # 中间目录必须带 profile：capture 与 player 的 configure 开关不同，不能复用同一份中间产物
@@ -187,20 +205,122 @@ class CliTest(unittest.TestCase):
         self.assertEqual(args.jobs, 8)
         self.assertEqual(args.output, "D:/out")
 
+    def test_crt_option(self):
+        # 默认 /MT 与现有产物一致；--crt md 给 /MD 的消费方（只影响 CMake 构建的库）
+        from ffmpeg_build.config import DEFAULT_CRT
+        from ffmpeg_build.toolchains import WindowsToolchain
+        args = build_parser().parse_args(["build", "--platform", "windows", "--crt", "md",
+                                          "-o", "D:/out"])
+        self.assertEqual(args.crt, "md")
+        self.assertEqual(DEFAULT_CRT, "mt")
+        for crt, lib, flag in (("mt", "MultiThreaded", "/MT"), ("md", "MultiThreadedDLL", "/MD")):
+            ctx = SimpleNamespace(abis=["x64"], output_root=Path("out"), crt=crt,
+                                  logger=Logger(verbose=False), runner=None)
+            tc = WindowsToolchain(ctx)
+            tc.msvc = SimpleNamespace(env={}, generator=None)
+            cmake = tc.cmake_args("x64")
+            self.assertIn(f"-DCMAKE_MSVC_RUNTIME_LIBRARY={lib}", cmake)
+            self.assertIn(f"-DCMAKE_CXX_FLAGS_RELEASE={flag} /O2 /Ob2 /DNDEBUG", cmake)
+            self.assertEqual(tc.crt_flag, flag)
+
+    def test_windows_layout_matches_3rd(self):
+        # Windows 产物布局要能整目录拷进 MediaX/ESMediaX/3rd 直接替换
+        from ffmpeg_build.config import WINDOWS_LAYOUT, platform_layout, windows_layout
+        from ffmpeg_build.toolchains import IOSToolchain, WindowsToolchain
+        self.assertEqual(windows_layout("ffmpeg"), "flat")     # ffmpeg/windows/{include,lib,bin}
+        self.assertEqual(windows_layout("libyuv"), "flat")
+        self.assertEqual(windows_layout("spdlog"), "lib")      # spdlog/windows/lib/<abi>
+        self.assertEqual(windows_layout("unknown_lib"), "abi")  # 未登记的默认带 abi 层
+
+        ctx = SimpleNamespace(abis=["x64"], output_root=Path("D:/out"), crt="mt",
+                              logger=Logger(verbose=False), runner=None)
+        tc = WindowsToolchain(ctx)
+        self.assertEqual(tc.install_dir("ffmpeg", "x64"), Path("D:/out/ffmpeg/windows"))
+        self.assertEqual(tc.install_dir("spdlog", "x64"), Path("D:/out/spdlog/windows"))
+        # 未登记的库保持 abi 层
+        self.assertEqual(tc.install_dir("unknown_lib", "x64"), Path("D:/out/unknown_lib/windows/x64"))
+        # 多 ABI 同时构建时 flat/lib 会互相覆盖 → 自动回落到 abi 目录
+        multi = SimpleNamespace(abis=["x64", "x86"], output_root=Path("D:/out"), crt="mt",
+                                logger=Logger(verbose=False), runner=None)
+        tc2 = WindowsToolchain(multi)
+        self.assertEqual(tc2.install_dir("ffmpeg", "x64"), Path("D:/out/ffmpeg/windows/x64"))
+        self.assertIn("ffmpeg", WINDOWS_LAYOUT)
+        # Android / OHOS：库带 abi 层，但 spdlog 与 3rd-bak 一致是不带 abi 的
+        self.assertEqual(platform_layout("android", "ffmpeg"), "abi")
+        self.assertEqual(platform_layout("android", "spdlog"), "flat")
+        self.assertEqual(platform_layout("ohos", "spdlog"), "flat")
+        self.assertEqual(platform_layout("ios", "ffmpeg"), "flat")   # fat 库无 abi 层
+        # iOS：多架构仍然合并为 fat（不回落 abi 目录）
+        ios_ctx = SimpleNamespace(abis=["arm64", "x86_64"], output_root=Path("D:/out"), crt="mt",
+                                  logger=Logger(verbose=False), runner=None)
+        ios = IOSToolchain(ios_ctx, min_version="13.0")
+        self.assertEqual(ios.install_dir("ffmpeg"), Path("D:/out/ffmpeg/ios"))
+        self.assertEqual(ios.marker_variant, "min13.0")
+
+    def test_portable_layout(self):
+        # header-only（json）与平台/ABI 无关：不带 <平台>/<abi> 层，三端共用一份
+        from ffmpeg_build.config import is_portable
+        from ffmpeg_build.toolchains import WindowsToolchain
+        self.assertTrue(is_portable("json"))
+        self.assertFalse(is_portable("ffmpeg"))
+        self.assertFalse(is_portable("spdlog"))
+        # 只输出 single_include（真正的合并单头），不再给它一份 include 副本
+        self.assertEqual(DEPS_LIBRARIES["json"].get("output_subdirs"), ["single_include"])
+        ctx = SimpleNamespace(abis=["x64"], output_root=Path("D:/out"), crt="mt",
+                              logger=Logger(verbose=False), runner=None)
+        tc = WindowsToolchain(ctx)
+        self.assertEqual(tc.install_dir("json", "x64"), Path("D:/out/json"))
+        # 标记里 platform=any、无 abi、compiler=header-only
+        from datetime import datetime
+        from ffmpeg_build.utils import build_marker_name
+        self.assertEqual(build_marker_name("json", "3.12.0", "any", "", "header-only",
+                                           "", datetime(2026, 10, 20, 11, 25)),
+                         "version-json-3.12.0-2026-10-20-11-25.any.header-only.txt")
+
+    def test_move_lib_into_abi(self):
+        import tempfile
+        from ffmpeg_build.toolchains import WindowsToolchain
+        root = Path(tempfile.mkdtemp())
+        (root / "lib").mkdir()
+        (root / "lib" / "spdlog.lib").write_text("x")
+        (root / "lib" / "cmake").mkdir()
+        WindowsToolchain._move_lib_into_abi(root, "x64")           # 幂等：再调一次不应嵌套
+        WindowsToolchain._move_lib_into_abi(root, "x64")
+        self.assertTrue((root / "lib" / "x64" / "spdlog.lib").exists())
+        self.assertFalse((root / "lib" / "x64" / "x64").exists())
+
     def test_build_marker_name(self):
         from datetime import datetime
         from ffmpeg_build.utils import build_marker_name
         name = build_marker_name("ffmpeg", "6.1.6", "windows", "x64", "msvc",
-                                 "1a2b3c4", datetime(2026, 10, 19, 10, 32))
-        self.assertEqual(name, "version-ffmpeg-6.1.6-g1a2b3c4-2026-10-19-10-32.windows.x64.msvc.txt")
-        # 无 commit（归档源码）时省略 g<sha>；iOS 无 abi 层
+                                 "1a2b3c4", datetime(2026, 10, 19, 10, 32), variant="crtmt")
+        self.assertEqual(name, "version-x64-ffmpeg-6.1.6-g1a2b3c4-2026-10-19-10-32"
+                               ".windows.x64.msvc.crtmt.txt")
+        # 无 commit（归档源码）时省略 g<sha>；iOS 无 abi 层（文件名里也就没有 abi 前缀）
         self.assertEqual(build_marker_name("libyuv", "0b9e5c92", "ios", "", "xcode-clang",
                                            "", datetime(2026, 10, 19, 11, 5)),
                          "version-libyuv-0b9e5c92-2026-10-19-11-05.ios.xcode-clang.txt")
         # ffmpeg 带 capture（开播）用途标记
         self.assertEqual(build_marker_name("ffmpeg", "6.1.6", "windows", "x64", "msvc",
                                            "3c1fc5df", datetime(2026, 10, 19, 10, 32), "capture"),
-                         "version-ffmpeg-6.1.6-g3c1fc5df-2026-10-19-10-32.windows.x64.capture.msvc.txt")
+                         "version-x64-ffmpeg-6.1.6-g3c1fc5df-2026-10-19-10-32"
+                         ".windows.x64.capture.msvc.txt")
+        # x86 也要能一眼分清
+        self.assertEqual(build_marker_name("spdlog", "v1.14.1", "windows", "x86", "msvc",
+                                           "27cb4c7", datetime(2026, 10, 20, 9, 5), variant="crtmd"),
+                         "version-x86-spdlog-v1.14.1-g27cb4c7-2026-10-20-09-05"
+                         ".windows.x86.msvc.crtmd.txt")
+        # Android / iOS 的关键信息：API 级别与最低系统版本（3rd-bak 里的文件名也是这么记的）
+        self.assertEqual(build_marker_name("ffmpeg", "6.1.6", "android", "arm64-v8a", "ndk-clang",
+                                           "3c1fc5df", datetime(2026, 10, 20, 12, 10),
+                                           "capture", "api21"),
+                         "version-arm64-v8a-ffmpeg-6.1.6-g3c1fc5df-2026-10-20-12-10"
+                         ".android.arm64-v8a.capture.ndk-clang.api21.txt")
+        self.assertEqual(build_marker_name("ffmpeg", "6.1.6", "ios", "", "xcode-clang",
+                                           "3c1fc5df", datetime(2026, 10, 20, 12, 10),
+                                           "capture", "min13.0"),
+                         "version-ffmpeg-6.1.6-g3c1fc5df-2026-10-20-12-10"
+                         ".ios.capture.xcode-clang.min13.0.txt")
 
     def test_output_root_is_mandatory(self):
         saved = os.environ.pop("FFMPEG_3RD_OUTPUT", None)
@@ -223,6 +343,59 @@ class CliTest(unittest.TestCase):
         finally:
             if saved:
                 os.environ["FFMPEG_3RD_OUTPUT"] = saved
+
+
+class FfmpegRecipeTest(unittest.TestCase):
+    def test_prune_source_tree_nogit(self):
+        # 非 git 源码树：删掉已知生成文件，且**不能**动 ffbuild/ 里的 tracked 源码
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "libavfilter").mkdir()
+            (src / "ffbuild").mkdir()
+            for rel in ("config.h", ".deps_pin", "libavfilter/filter_list.c",
+                        "libavfilter/allfilters.c", "libavfilter/af_volume.o",
+                        "ffbuild/common.mak", "ffbuild/config.mak"):
+                (src / rel).write_text("x")
+            self.assertTrue(recipes.prune_source_tree(src, Logger(verbose=False)))
+            self.assertFalse((src / "config.h").exists())
+            self.assertFalse((src / "libavfilter" / "filter_list.c").exists())
+            self.assertFalse((src / "ffbuild" / "config.mak").exists())
+            # 保留：源码管理器的 .deps_pin、tracked 源码（含 ffbuild 目录本体）
+            self.assertTrue((src / ".deps_pin").exists())
+            self.assertTrue((src / "libavfilter" / "allfilters.c").exists())
+            self.assertTrue((src / "ffbuild" / "common.mak").exists())
+            self.assertFalse(recipes.prune_source_tree(src, Logger(verbose=False)))
+
+    def test_prune_source_tree_git(self):
+        # git 源码树走 git clean -xfd：残留被清掉，tracked 源码与 .deps_pin 不受影响
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "libavfilter").mkdir()
+            (src / "libavfilter" / "allfilters.c").write_text("x")
+            (src / "ffbuild").mkdir()
+            (src / "ffbuild" / "common.mak").write_text("x")
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": "NUL", "GIT_CONFIG_SYSTEM": "NUL"}
+            run = lambda *a: subprocess.run(["git", "-C", str(src), *a], check=True,
+                                            capture_output=True, env=env)
+            run("init", "-q")
+            run("add", ".")
+            run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+            # 模拟历史 in-source 构建残留
+            (src / "config.h").write_text("x")
+            (src / "libavfilter" / "filter_list.c").write_text("x")
+            (src / "libavfilter" / "af_volume.o").write_text("x")
+            (src / ".deps_pin").write_text("x")
+            self.assertTrue(recipes.prune_source_tree(src, Logger(verbose=False)))
+            self.assertFalse((src / "config.h").exists())
+            self.assertFalse((src / "libavfilter" / "filter_list.c").exists())
+            self.assertFalse((src / "libavfilter" / "af_volume.o").exists())
+            self.assertTrue((src / ".deps_pin").exists())          # 锁定标记必须留
+            self.assertTrue((src / "libavfilter" / "allfilters.c").exists())
+            self.assertTrue((src / "ffbuild" / "common.mak").exists())
+            self.assertFalse(recipes.prune_source_tree(src, Logger(verbose=False)))
 
 
 if __name__ == "__main__":

@@ -12,9 +12,9 @@ from typing import List
 
 from . import bootstrap
 from . import deps_env  # noqa: F401  必须在 config 之前：预扫描 --deps/--profile/--config-dir
-from .config import (ACTIVE_PROFILE, BUILD_ORDER, DEPS_FILE, ENV_OUTPUT, FFMPEG_DEP_FLAGS,
-                     OPTIONAL_LIBRARIES, BuildContext, LIBRARIES, dep_group, dep_profile,
-                     resolve_output_root, resolve_selection, whitelist)
+from .config import (ACTIVE_PROFILE, BUILD_ORDER, CRT_OPTIONS, DEFAULT_CRT, DEPS_FILE, ENV_OUTPUT,
+                     FFMPEG_DEP_FLAGS, OPTIONAL_LIBRARIES, BuildContext, LIBRARIES, dep_group,
+                     dep_profile, is_portable, resolve_output_root, resolve_selection, whitelist)
 from .recipes import REGISTRY
 from .toolchains import TOOLCHAINS, create_toolchain, normalize_platform
 from .utils import (CommandRunner, Logger, build_marker_name, git_head_sha,
@@ -89,6 +89,9 @@ def _common(parser: argparse.ArgumentParser, require_output: bool = True) -> Non
     parser.add_argument("--ohos-sdk", default=None, help="OHOS SDK 根目录（含 native/），默认取 $OHOS_SDK")
     parser.add_argument("--min-version", default="12.0", help="iOS 最低版本，默认 12.0")
     parser.add_argument("--force-fetch", action="store_true", help="强制重新拉取源码")
+    parser.add_argument("--crt", default=None, choices=list(CRT_OPTIONS),
+                        help=f"Windows 运行时库：mt=/MT 静态（默认，与现有产物一致）；md=/MD 动态（给 /MD 的消费方）。"
+                             f"只对 CMake 构建的库生效；openssl/ffmpeg 始终 /MT")
     _deps_args(parser)
 
 
@@ -182,6 +185,14 @@ def cmd_build(args, logger: Logger) -> int:
     logger.section(f"开始编译: {ctx.summary}")
     logger.info(f"依赖锁定文件: {DEPS_FILE} (profile={ACTIVE_PROFILE})")
     logger.info(_profile_summary())
+    if ctx.platform == "windows":
+        logger.info(f"Windows 运行时库: {getattr(ctx.toolchain, 'crt_flag', '/MT')}"
+                    f"（--crt {ctx.crt}；openssl/ffmpeg 始终 /MT）")
+        if ctx.crt == "md" and "ffmpeg" in libraries:
+            # ffmpeg 本体始终按 /MT 编（它是 DLL，C 接口，被 /MD 的 exe 加载没问题），
+            # 但把 /MD 的静态库链进 /MT 的 ffmpeg 会打架
+            logger.warn("--crt md 与 ffmpeg 一起构建会把 /MD 的静态库链进 /MT 的 ffmpeg（CRT 冲突）。\n"
+                        "  建议：ffmpeg 走默认 --crt mt；只给应用直链的库（spdlog/libyuv/json）单独出 /MD。")
     results = {}
     for name in libraries:
         started = time.time()
@@ -199,8 +210,17 @@ def cmd_build(args, logger: Logger) -> int:
     logger.section("产物汇总")
     for name, output in results.items():
         logger.info(f"{name:<10} -> {output}")
-        for item in static_lib_names(output / "lib"):
+        if is_portable(name):       # header-only：没有 lib，列出顶层目录即可
+            for item in sorted(p.name for p in output.iterdir() if p.is_dir()):
+                logger.info(f"{'':<14}{item}/")
+            continue
+        lib_root = output / "lib"
+        for item in static_lib_names(lib_root):
             logger.info(f"{'':<14}lib/{item}")
+        # spdlog 这类"abi 在 lib 里"的布局，静态库在 lib/<abi>/ 下
+        for sub in sorted(p for p in lib_root.glob("*") if p.is_dir()) if lib_root.exists() else []:
+            for item in static_lib_names(sub):
+                logger.info(f"{'':<14}lib/{sub.name}/{item}")
     logger.info(f"全部完成，共 {len(results)} 个库")
     return 0
 
@@ -232,6 +252,7 @@ def make_context(args, logger: Logger, require_output: bool = True) -> BuildCont
         ffmpeg_ref=getattr(args, "ffmpeg_ref", None),
         ffmpeg_lto=getattr(args, "lto", False),
         enable_nvenc=getattr(args, "enable_nvenc", False),
+        crt=(getattr(args, "crt", None) or DEFAULT_CRT).lower(),
     )
     ctx.logger = logger
     ctx.runner = CommandRunner(logger, dry_run=ctx.dry_run, log_dir=ctx.log_root)
@@ -254,7 +275,8 @@ def _clean(ctx, libraries: List[str], output_too: bool = False) -> None:
             if work.exists():
                 shutil.rmtree(work, ignore_errors=True)
         if output_too:
-            target = ctx.output_root / name / ctx.platform
+            # portable（header-only）库没有平台层，必须用 install_dir 取真实产物目录
+            target = ctx.install_dir(name)
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
                 ctx.logger.info(f"删除产物 {target}")
@@ -268,9 +290,17 @@ def _write_manifest(ctx, name: str, output: Path) -> None:
     abi = ctx.abis[0] if len(ctx.abis) == 1 else (",".join(ctx.abis) if ctx.abis else "")
     now = datetime.now()
     profile = dep_profile(name)
-    marker = build_marker_name(name, lib.version, ctx.platform, abi,
-                               getattr(ctx.toolchain, "compiler_id", "unknown"),
-                               commit=commit, when=now, profile=profile)
+    # header-only 这类 portable 库与平台/架构/编译器无关：标记里写成 any / header-only
+    portable = is_portable(name)
+    marker_platform = "any" if portable else ctx.platform
+    marker_abi = "" if portable else abi
+    marker_compiler = "header-only" if portable else getattr(ctx.toolchain, "compiler_id", "unknown")
+    marker = build_marker_name(name, lib.version, marker_platform, marker_abi,
+                               marker_compiler, commit=commit, when=now, profile=profile,
+                               variant="" if portable else getattr(ctx.toolchain, "marker_variant", ""))
+    # 同一个库只保留一份标记：多次构建会留下带不同时间戳的旧文件，容易被误当成当前产物
+    for stale in output.glob("version-*.txt"):
+        stale.unlink()
     write_version_file(output / marker, [
         f"library    : {name}",
         f"version    : {lib.version}",
@@ -278,8 +308,11 @@ def _write_manifest(ctx, name: str, output: Path) -> None:
         f"profile    : {profile or '-'}",
         f"group      : {dep_group(name) or '-'}",
         f"summary    : {lib.summary}",
-        f"platform   : {ctx.platform} ({', '.join(ctx.abis)})",
-        f"compiler   : {getattr(ctx.toolchain, 'compiler_id', 'unknown')}",
+        f"platform   : {marker_platform}" + ("" if portable else f" ({', '.join(ctx.abis)})"),
+        f"compiler   : {marker_compiler}",
+        f"crt        : {'-' if portable else (getattr(ctx.toolchain, 'crt_flag', '') or '-')}",
+        f"variant    : {'-' if portable else (getattr(ctx.toolchain, 'marker_variant', '') or '-')}",
+        f"layout     : {'portable' if portable else ctx.toolchain.layout_of(name)}",
         f"build time : {now.isoformat(timespec='seconds')}",
         f"build host : {pl.system()} {pl.machine()}",
         f"source     : {ctx.source_dir(name)}",

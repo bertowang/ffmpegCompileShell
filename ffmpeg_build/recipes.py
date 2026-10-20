@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -266,19 +268,24 @@ def build_libyuv(ctx, abi: str) -> Path:
 
 # ---------------------------------------------------------------------- json
 def build_json(ctx, abi: str) -> Path:
-    """header-only：只需归集头文件（同时提供 single_include 兼容旧引用路径）。"""
+    """header-only：只搬头文件。
+
+    源码包里有两个目录，语义不同，不能互相替代：
+      * ``single_include/nlohmann/json.hpp`` —— 合并后的单头文件（~930KB，自包含），
+        ESMediaX/3rd 里 json 就是这么放的（工程包含路径指向 single_include）。
+      * ``include/nlohmann/...`` —— 模块化多头文件（46 个 .hpp），需要整体带出。
+    输出哪些目录由锁定文件的 ``output_subdirs`` 决定，默认两个都给。
+    （旧实现把 include 复制成两份冒充 single_include，既不是真单头也重复占空间。）
+    """
     _set_current("json")
     src = ctx.sources.ensure(C.LIBRARIES["json"].source, ctx.source_dir("json"), ctx.force_fetch)
     stage = ensure_dir(ctx.stage_dir("json", abi))
-    source_include = src / "include"
-    if not source_include.exists():
-        raise RuntimeError(f"json 源码缺少 include: {src}")
-    for target_dir in (stage / "include", stage / "single_include"):
-        ensure_dir(target_dir)
-        for header in source_include.rglob("*.hpp"):
-            destination = target_dir / header.relative_to(source_include)
-            ensure_dir(destination.parent)
-            shutil.copy2(header, destination)
+    subdirs = C.DEPS_LIBRARIES["json"].get("output_subdirs") or ["include", "single_include"]
+    for sub in subdirs:
+        source_sub = src / sub
+        if not source_sub.exists():
+            raise RuntimeError(f"json 源码缺少 {sub}: {src}")
+        copy_tree(source_sub, stage / sub)
     return stage
 
 
@@ -304,7 +311,131 @@ def build_spdlog(ctx, abi: str) -> Path:
     return ctx.stage_dir("spdlog", abi)
 
 
+# --------------------------------------------------------------------- zlib
+# FFmpeg 的 png 解码器依赖 zlib（png_decoder_select="inflate_wrapper" → zlib）：
+# 没有它，水印/logo 这类 PNG 图片根本解码不了（ESMediaX 的水印加载就是踩这个）。
+# 只编静态库；并补 z.lib / libz.a 别名——zlib.pc 与 ffmpeg 的 check_lib 都按 -lz 找。
+def build_zlib(ctx, abi: str) -> Path:
+    _set_current("zlib")
+    src = ctx.sources.ensure(C.LIBRARIES["zlib"].source, ctx.source_dir("zlib"), ctx.force_fetch)
+    build_dir = ctx.work_dir("zlib", abi) / "cmake-build"
+    cmake_configure(ctx, src, build_dir, abi, extra=[
+        "-DZLIB_BUILD_SHARED=OFF",      # 只要静态库，避免多出一个 zlib1.dll
+        "-DZLIB_BUILD_STATIC=ON",
+        "-DZLIB_BUILD_TESTING=OFF",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+    ])
+    cmake_build(ctx, build_dir, abi, target="zlibstatic", lib="zlib")
+    cmake_install(ctx, build_dir, abi, lib="zlib")
+
+    stage = ctx.stage_dir("zlib", abi)
+    lib_dir = ensure_dir(stage / "lib")
+    for built in sorted(lib_dir.glob("*.lib")) + sorted(lib_dir.glob("*.a")):
+        for alias in (("z.lib", "zlib.lib") if built.suffix == ".lib" else ("libz.a",)):
+            target = lib_dir / alias
+            if not target.exists():
+                shutil.copy2(built, target)
+    return stage
+
+
 # -------------------------------------------------------------------- ffmpeg
+# ffmpeg 采用 out-of-tree 构建（configure 在各 profile 独立的 build 目录里跑），
+# 但源码树若残留**历史 in-source 构建**产物就会被静默误用：
+#   libavfilter/allfilters.c 里是 `#include "libavfilter/filter_list.c"`（引号包含），
+#   编译器优先搜索**被包含文件所在目录** → 命中源码树里的旧 filter_list.c；
+#   结果新滤镜虽编译出 af_volume.o/af_amix.o/af_asetnsamples.o，却没登记进
+#   filter_list[]，运行期 `ffmpeg -filters` 仍是旧列表，开播滤镜链报
+#   "No option name near '1.0'"/找不到 volume/amix。
+#   codec_list/muxer_list/demuxer_list/protocol_list/bsf_list/parser_list 同理。
+# 组件表（*_list.c）是被下面这些 .c 用**引号**包含进去的，而生成表不参与依赖跟踪
+# （MSVC 的 .d 里没有它），所以增量编译时会出现"表已更新、目标文件没重编"：
+# 补了 extract_extradata 之后 `ffmpeg -bsfs` 依旧列不出来，就是 bitstream_filters.o 没重编。
+# 每次构建前删掉这几个目标文件，强制按新表重编（代价只有 6 个文件）。
+FFMPEG_LIST_CONSUMERS = {
+    "libavcodec": ("allcodecs.o", "bitstream_filters.o", "parsers.o"),
+    "libavfilter": ("allfilters.o",),
+    "libavformat": ("allformats.o", "protocols.o"),
+}
+
+
+def drop_component_list_objects(build_dir: Path, logger) -> None:
+    dropped = 0
+    for subdir, names in FFMPEG_LIST_CONSUMERS.items():
+        for name in names:
+            target = build_dir / subdir / name
+            if target.exists():
+                target.unlink()
+                dropped += 1
+    if dropped:
+        logger.debug(f"使 {dropped} 个组件表目标文件失效（强制按最新 *_list.c 重编）")
+
+
+FFMPEG_GENERATED_FILES = (
+    # configure 产物：源码树里的 config.h/config.asm 会被引号包含优先命中
+    "config.h", "config.asm", "config.mak", "config.texi", "version.h", "ffversion.h",
+    ".version", ".config",
+    # 组件表（*_list.c）
+    "libavcodec/bsf_list.c", "libavcodec/codec_list.c", "libavcodec/parser_list.c",
+    "libavdevice/indev_list.c", "libavdevice/outdev_list.c",
+    "libavfilter/filter_list.c",
+    "libavformat/demuxer_list.c", "libavformat/muxer_list.c", "libavformat/protocol_list.c",
+    # ffbuild/ 本身是受版本控制的源码目录（common.mak 等），只清里面的 configure 产物
+    "ffbuild/config.mak", "ffbuild/config.sh", "ffbuild/config.log",
+    "ffbuild/config.fate", "ffbuild/.config",
+)
+
+
+def _git_clean(src: Path, dry_run: bool) -> int:
+    cmd = ["git", "-C", str(src), "clean", "-xfd", "-e", ".deps_pin"]
+    if dry_run:
+        cmd.append("-n")
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if proc.returncode != 0:
+        raise RuntimeError(f"git clean 失败: {proc.stderr.strip()}")
+    return len([line for line in proc.stdout.splitlines() if line.strip()])
+
+
+def prune_source_tree(src: Path, logger) -> bool:
+    """清掉源码树内历史构建残留，返回是否发生过清理。
+
+    优先走 ``git clean -xfd``：一次性、彻底，且天然不会误删受版本控制的源码
+    （ffbuild/、tests/ 里都混着 tracked 文件，按目录删会毁掉源码）。
+    非 git 源码树（解压的 tarball）退化为删除已知生成文件。
+    ``.deps_pin`` 是源码管理器的锁定标记，必须保留，否则每次都会重新克隆。
+    """
+    if (src / ".git").exists():
+        pending = _git_clean(src, dry_run=True)
+        if not pending:
+            return False
+        _git_clean(src, dry_run=False)
+        logger.info(f"清理 ffmpeg 源码树内 {pending} 项历史构建残留"
+                    f"（残留的 *_list.c / config.h 会覆盖新配置）: {src}")
+        return True
+    removed = 0
+    for rel in FFMPEG_GENERATED_FILES:
+        target = src / rel
+        if target.is_file():
+            target.unlink()
+            removed += 1
+    if removed:
+        logger.info(f"清理 ffmpeg 源码树内 {removed} 项历史构建残留"
+                    f"（残留的 *_list.c / config.h 会覆盖新配置）: {src}")
+    return removed > 0
+
+
+def remove_tree(path: Path) -> None:
+    """删目录：走系统命令（海量 .o 逐个 unlink 既慢又容易被批量删除保护拦截）。"""
+    path = Path(path)
+    if not path.exists():
+        return
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(path)], check=False)
+    else:
+        subprocess.run(["rm", "-rf", str(path)], check=False)
+    if path.exists():                       # 兜底
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def build_ffmpeg(ctx, abi: str) -> Path:
     _set_current("ffmpeg")
     stage = ensure_dir(ctx.stage_dir("ffmpeg", abi))
@@ -318,6 +449,7 @@ def build_ffmpeg(ctx, abi: str) -> Path:
         from .utils import GitSource
         source = replace(source, ref=ctx.ffmpeg_ref)
     src = ctx.sources.ensure(source, ctx.source_dir("ffmpeg"), ctx.force_fetch)
+    pruned = prune_source_tree(src, ctx.logger)
 
     prefixes = _dependency_prefixes(ctx, abi)
     args = _ffmpeg_common_args(ctx, abi, stage, prefixes)
@@ -336,7 +468,14 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     # 必须**源码外**构建：ffmpeg 是 in-source 编译，两个 profile 共用 sources/ffmpeg 时
     # 会互相踩到对方的 config.h 与 .o（曾出现 player 链接到 capture 的 random_seed.o、
     # 报 RAND_bytes 未解析）。放到 <profile>-<platform>-<abi>/ffmpeg/build 里各自独立。
-    build_dir = ensure_dir(ctx.work_dir("ffmpeg", abi) / "build")
+    work_dir = ctx.work_dir("ffmpeg", abi)
+    if pruned:
+        # 源码树刚被清理：旧目标文件对应的组件表已失效，且 allfilters.o/allcodecs.o
+        # 只依赖同名 .c（不含 *_list.c），make 不会自动重编 → 必须重建中间目录
+        ctx.logger.info("源码树有残留被清理，重建 ffmpeg 中间目录（全量重编）")
+        remove_tree(work_dir)
+    build_dir = ensure_dir(work_dir / "build")
+    drop_component_list_objects(build_dir, ctx.logger)
     script = (f"export PKG_CONFIG_PATH='{pkg_config_path}' && {to_path(src / 'configure')} "
               + " ".join(args) + f" && make -j{ctx.jobs} && make install")
     ctx.toolchain.sh(script, cwd=build_dir, abi=abi, env=env, log_name=f"ffmpeg-{abi}")
@@ -347,7 +486,45 @@ def build_ffmpeg(ctx, abi: str) -> Path:
         for import_lib in bin_dir.glob("*.lib"):
             if not (lib_dir / import_lib.name).exists():
                 shutil.copy2(import_lib, lib_dir / import_lib.name)
+        _verify_components(ctx, stage)
     return stage
+
+
+# 运行期组件自检：白名单里写了、但二进制没登记（GPL 冲突/依赖缺失/组件表被旧文件覆盖）
+# 都会静默发生，只有跑起来才暴露（如开播滤镜链找不到 volume/amix）。
+# 只在能直接执行产物的平台上跑（Windows 本机），交叉编译产物无法在宿主运行。
+_COMPONENT_CHECKS = (("filters", "-filters"), ("decoders", "-decoders"),
+                     ("encoders", "-encoders"), ("demuxers", "-demuxers"),
+                     ("muxers", "-muxers"), ("protocols", "-protocols"),
+                     ("bsfs", "-bsfs"))
+# 白名单用的是 configure 的内部名，ffmpeg CLI 对外显示名可能不同
+_COMPONENT_ALIASES = {"protocols": {"libsrt": "srt"},
+                      "demuxers": {"image_png_pipe": "png_pipe"}}
+
+
+def _verify_components(ctx, stage: Path) -> None:
+    exe = stage / "bin" / "ffmpeg.exe"
+    if not exe.exists():
+        return
+    wl = C.whitelist(getattr(ctx, "profile", ""))
+    wl = dict(wl, encoders=C.whitelist_encoders(ctx.platform, ctx.enable_nvenc,
+                                                getattr(ctx, "profile", "")),
+              bsfs=C.whitelist_bsfs(getattr(ctx, "profile", "")))
+    try:
+        for key, flag in _COMPONENT_CHECKS:
+            aliases = _COMPONENT_ALIASES.get(key, {})
+            wanted = [aliases.get(n, n) for n in (wl.get(key) or []) if n]
+            if not wanted:
+                continue
+            text = subprocess.run([str(exe), "-hide_banner", flag], capture_output=True,
+                                  text=True, errors="replace", timeout=60).stdout
+            missing = [n for n in wanted
+                       if not re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", text)]
+            if missing:
+                ctx.logger.warn(f"[{key}] {len(missing)} 个组件白名单项未编进产物: "
+                                f"{', '.join(missing)}")
+    except (OSError, subprocess.SubprocessError) as exc:      # 自检失败不影响构建结果
+        ctx.logger.debug(f"组件自检跳过: {exc}")
 
 
 FFMPEG_DEPENDENCIES = C.FFMPEG_DEPENDENCIES   # 来自锁定文件的 ffmpeg_deps 组（player 为空）
@@ -397,7 +574,8 @@ def _ffmpeg_common_args(ctx, abi, stage: Path, prefixes) -> List[str]:
         *enable("muxer", "muxers"),
         *enable("demuxer", "demuxers"),
         *enable("parser", "parsers"),
-        *enable("bsf", "bsfs"),
+        # bsf 用"白名单 + avformat 内部自动插入的过滤器"：后者裁掉只在运行期炸
+        *enable("bsf", "bsfs", C.whitelist_bsfs(getattr(ctx, "profile", ""))),
         *enable("filter", "filters"),
         *enable("protocol", "protocols"),
         # 外部库：开关来自锁定文件 ffmpeg_deps 组的 ffmpeg_flag（player 为空）
@@ -474,6 +652,7 @@ def _ffmpeg_platform_args(ctx, abi) -> List[str]:
 
 
 REGISTRY = {
+    "zlib": build_zlib,
     "openssl": build_openssl,
     "srt": build_srt,
     "fdk-aac": build_fdk_aac,

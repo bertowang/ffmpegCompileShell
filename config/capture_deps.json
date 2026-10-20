@@ -47,6 +47,18 @@
       "description": "FFmpeg 的构建期依赖：configure 需对应 --enable-*，产物静态并入 avcodec/avformat。Windows 上应用无需再链；Android 为独立 .so，需随包并显式链接",
       "build_input_of": "ffmpeg",
       "libraries": {
+        "zlib": {
+          "kind": "archive",
+          "version": "1.3.2",
+          "homepage": "https://github.com/madler/zlib",
+          "url": "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz",
+          "tag": "v1.3.2",
+          "commit": "da607da739fa6047df13e66a2af6b8bec7c2a498",
+          "strip_components": 1,
+          "sha256": "",
+          "ffmpeg_flag": "--enable-zlib",
+          "note": "FFmpeg 的 png 解码器依赖 zlib（png_decoder_select=inflate_wrapper）；缺它则水印/logo 图片无法解码"
+        },
         "openssl": {
           "kind": "archive",
           "version": "3.6.5",
@@ -111,6 +123,8 @@
         },
         "json": {
           "kind": "archive",
+          "layout": "portable",
+          "output_subdirs": ["single_include"],
           "version": "3.12.0",
           "homepage": "https://github.com/nlohmann/json",
           "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/include.zip",

@@ -24,6 +24,64 @@ BUILD_DIR = "build"
 CACHE_DIR = ".cache"
 TOOLS_DIR = "tools"
 
+# Windows 运行时库选项（只对 CMake 构建的库生效；openssl/ffmpeg 始终 /MT）
+DEFAULT_CRT = "mt"                # mt=/MT 静态链接 CRT，md=/MD 动态链接 CRT
+CRT_OPTIONS = ("mt", "md")
+
+# ------------------------------------------------- Windows 产物目录布局（兼容 3rd 目录）
+# 为了能把产物整目录拷到 MediaX/ESMediaX 的 3rd 直接替换，Windows 下的目录结构
+# 与 3rd-bak 保持一致；三种布局：
+#   flat : <库>/windows/{include,lib,bin}              —— ffmpeg/libyuv/openssl/…（3rd-bak 主流）
+#   lib  : <库>/windows/include + <库>/windows/lib/<abi> —— spdlog（3rd-bak 里 abi 在 lib 内）
+#   abi  : <库>/windows/<abi>/{include,lib,bin}         —— 本工程默认；同时编多个 ABI 时自动用它
+WINDOWS_LAYOUT: Dict[str, str] = {
+    "ffmpeg": "flat",
+    "libyuv": "flat",
+    "spdlog": "lib",
+    "zlib": "flat",
+    "openssl": "flat",
+    "srt": "flat",
+    "fdk-aac": "flat",
+    "openh264": "flat",
+    "json": "flat",
+}
+# Android / OHOS：库本身带 abi 层，但 spdlog 在 3rd-bak 里是 <库>/android/{include,lib}
+ANDROID_LAYOUT: Dict[str, str] = {"spdlog": "flat"}
+OHOS_LAYOUT: Dict[str, str] = {"spdlog": "flat"}
+# iOS 走 lipo 合并的 fat 库，天然没有 abi 层
+IOS_LAYOUT: Dict[str, str] = {}
+
+PLATFORM_LAYOUT: Dict[str, Dict[str, str]] = {
+    "windows": WINDOWS_LAYOUT,
+    "android": ANDROID_LAYOUT,
+    "ohos": OHOS_LAYOUT,
+    "ios": IOS_LAYOUT,
+}
+DEFAULT_PLATFORM_LAYOUT: Dict[str, str] = {
+    "windows": "abi", "android": "abi", "ohos": "abi", "ios": "flat",
+}
+DEFAULT_WINDOWS_LAYOUT = DEFAULT_PLATFORM_LAYOUT["windows"]
+
+
+def windows_layout(lib: str) -> str:
+    return platform_layout("windows", lib)
+
+
+def platform_layout(platform: str, lib: str) -> str:
+    """某平台上某库的目录布局：flat(无 abi 层) / lib(abi 在 lib 内) / abi(<平台>/<abi>)。"""
+    table = PLATFORM_LAYOUT.get(platform, {})
+    return table.get(lib, DEFAULT_PLATFORM_LAYOUT.get(platform, "abi"))
+
+
+# 与平台/ABI/编译器都无关的库（header-only 之类）：产物直接放 <输出根>/<库>/，
+# 不再套 <平台>[/<abi>] 层，三端共用一份（与 MediaX/ESMediaX/3rd 里 json submodule 的布局一致）。
+# 由锁定文件条目的 "layout": "portable" 声明，不在代码里硬编码库名。
+PORTABLE_LAYOUT = "portable"
+
+
+def is_portable(lib: str) -> bool:
+    return (DEPS_LIBRARIES.get(lib) or {}).get("layout") == PORTABLE_LAYOUT
+
 # ----------------------------------------------------------------- 源码仓库
 # 所有依赖的「地址 / 版本 / commit」统一锁定在 config/<profile>_deps.json：
 # 只要确定该文件，任何时候都能编出完全相同的目标库（升级版本只改锁定文件）。
@@ -112,6 +170,30 @@ OHOS_FFMPEG_EXTRA_ARGS: List[str] = ["--enable-ohosavcodecdecoder"]
 # ------------------------------------------------------- ffmpeg 裁剪白名单
 # 裁剪白名单按 profile 分组：开播要编码+封装+推流，播放要解封装+解码+渲染，
 # 两者组件集不同，因此不能共用一份。--profile 决定用哪一份。
+
+# 开播常用滤镜"全集"：与其每次踩到一个漏一个，不如把开播链路真正会用到的滤镜一次开齐
+# （均已核对存在于 6.1 源码，且不依赖 freetype/libass/zimg 等外部库）。
+# 音频混音链必须有 volume / amix / asetnsamples，否则 ESAudioMixer 的 filtergraph 直接解析失败。
+# 注意：eq / delogo / boxblur / perspective 是 GPL-only，而 capture 为了 libfdk_aac
+# 必须 --enable-nonfree（与 GPL 不兼容），这四个会被 configure 静默关掉，故不写进白名单。
+CAPTURE_FILTERS: List[str] = [
+    # 视频
+    "null", "format", "scale", "scale2ref", "overlay", "crop", "pad", "fps", "framerate",
+    "transpose", "hflip", "vflip", "rotate", "hwupload", "hwdownload", "setpts", "trim",
+    "split", "copy", "shuffleplanes", "shuffleframes", "colorspace", "fieldorder",
+    "hue", "colorchannelmixer", "colorlevels", "lut", "negate", "curves", "geq",
+    "drawbox", "drawgrid", "fade", "chromakey", "colorkey", "deshake",
+    "yadif", "bwdif", "w3fdif", "unsharp", "avgblur", "gblur", "noise",
+    "pixelize", "thumbnail", "tile", "blackdetect", "signalstats",
+    "select", "tblend", "mix",
+    # 音频
+    "anull", "aformat", "aresample", "volume", "amix", "amerge", "asetnsamples", "asetrate",
+    "atrim", "apad", "asplit", "afade", "adelay", "channelmap", "pan", "loudnorm",
+    "dynaudnorm", "acompressor", "agate", "aecho", "highpass", "lowpass", "bandpass",
+    "allpass", "equalizer", "bass", "treble", "compand", "atempo", "silencedetect",
+    "silenceremove", "astats", "areverse", "afifo",
+]
+
 CAPTURE_WHITELIST: Dict[str, object] = {
     "description": "开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)，其余组件全部裁掉",
     # 开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)
@@ -119,11 +201,14 @@ CAPTURE_WHITELIST: Dict[str, object] = {
     "platform_encoders": {"windows": [], "android": ["h264_mediacodec"], "ios": ["h264_videotoolbox"]},
     "decoders": ["h264", "aac", "png"],
     "muxers": ["flv", "mpegts"],
-    "demuxers": ["mov", "flv", "mp4"],
+    # image2 / image_png_pipe：水印 logo 之类的 png 图片要经 avformat 打开
+    "demuxers": ["mov", "flv", "mp4", "image2", "image_png_pipe"],
     "parsers": ["h264", "aac"],
     "bsfs": ["h264_mp4toannexb", "aac_adtstoasc", "null"],
-    "filters": ["null", "anull", "format", "aformat", "scale", "aresample", "overlay"],
-    "protocols": ["file", "tcp", "tls", "rtmp", "rtmps", "srt"],
+    "filters": list(CAPTURE_FILTERS),
+    # http/https：拉 https 水印图、http-flv 等资源需要；libsrt 才是 SRT 协议的正确名字
+    # （协议内部名是 libsrt，URL scheme 才是 srt；写 srt 会被 configure 静默忽略）
+    "protocols": ["file", "tcp", "tls", "http", "https", "rtmp", "rtmps", "libsrt"],
 }
 
 PLAYER_WHITELIST: Dict[str, object] = {
@@ -164,6 +249,24 @@ def whitelist(profile: str = "") -> Dict[str, object]:
     return PROFILE_WHITELIST.get(profile or ACTIVE_PROFILE, CAPTURE_WHITELIST)
 
 
+# avformat 会在封装/解封装路径上**自动插入**这些 bsf，与白名单怎么写无关：
+#   flvenc.c  -> h264 插 extract_extradata、aac 插 aac_adtstoasc
+#   mpegtsenc -> h264 插 h264_mp4toannexb
+#   demux.c   -> 缺 extradata 的流插 extract_extradata
+# 裁掉任何一个都只在运行期报错（AVERROR_BSF_NOT_FOUND = -1179861752），
+# configure 阶段完全看不出来，所以这里强制并入，不受 profile 白名单影响。
+AUTO_BSFS: List[str] = ["extract_extradata", "null"]
+
+
+def whitelist_bsfs(profile: str = "") -> List[str]:
+    """profile 声明的 bsf + avformat 内部自动插入的 bsf（去重、保序）。"""
+    items = list(whitelist(profile).get("bsfs") or [])
+    for name in AUTO_BSFS:
+        if name not in items:
+            items.append(name)
+    return items
+
+
 def whitelist_encoders(platform: str, nvenc: bool = False, profile: str = "") -> List[str]:
     wl = whitelist(profile)
     encoders = list(wl["encoders"]) + list(wl["platform_encoders"].get(platform, []))
@@ -184,6 +287,7 @@ class Library:
 # 锁定文件里没列的库不会出现在这里（例如 player 只有 ffmpeg/json/spdlog），
 # 换 profile 即换一组库，无需改代码。
 _LIBRARY_SUMMARY: Dict[str, str] = {
+    "zlib": "通用压缩库（FFmpeg --enable-zlib；PNG 解码/水印依赖，无它 png 解码器会被裁掉）",
     "openssl": "TLS/HTTPS/RTMPS（已按 RTMPS 场景裁剪）",
     "srt": "SRT 推流协议（ffmpeg --enable-libsrt）",
     "fdk-aac": "AAC 音频软编码",
@@ -202,7 +306,7 @@ LIBRARIES: Dict[str, Library] = {
 }
 
 # 必须要的库（被依赖方在前，ffmpeg 最后）；只取当前锁定文件里存在的
-_ALL_BUILD_ORDER = ("openssl", "srt", "fdk-aac", "openh264", "libyuv", "ffmpeg")
+_ALL_BUILD_ORDER = ("zlib", "openssl", "srt", "fdk-aac", "openh264", "libyuv", "ffmpeg")
 # 默认不构建：json 是 header-only（MediaX 侧通常已由 3rd submodule 提供），
 # spdlog 只有 MediaX 的 ESLogger 需要（TGCapture 自带 Logger），均按需 --libs xxx
 _ALL_OPTIONAL = ("json", "spdlog")
@@ -244,6 +348,8 @@ class BuildContext:
     ffmpeg_lto: bool = False
     enable_nvenc: bool = False
     profile: str = ACTIVE_PROFILE     # 用途（capture/player）：决定白名单、外部库开关、中间目录
+    # Windows 运行时库：mt=/MT 静态（默认，与现有产物一致）；md=/MD 动态（给 /MD 的消费方，如 ESMediaX）
+    crt: str = DEFAULT_CRT
 
     toolchain: object = None          # 由 cli 装配
     logger: Logger = field(default_factory=Logger)
