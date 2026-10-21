@@ -15,7 +15,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 Command = Union[str, Sequence[str]]
 
@@ -39,11 +39,24 @@ _tolerant_stdio()
 
 @dataclass(frozen=True)
 class GitSource:
-    """git 源码：``ref`` 为 tag/branch，``commit`` 优先级更高。"""
+    """git 源码：``ref`` 为 tag/branch，``commit`` 优先级更高。
+
+    大仓库（如 AMF 带 490MB 的 Thirdparty）用 ``sparse`` 只检出需要的子目录：
+
+      * ``depth``   -> ``--depth 1``，只要锁定的那一版，不要历史；
+      * ``partial`` -> ``--filter=blob:none``，blob 按需下载，sparse 之外的
+        内容（Thirdparty）连字节都不落地；服务器不支持时自动退回普通浅克隆；
+      * ``sparse``  -> 写入 ``.git/info/sparse-checkout``（传统模式，不依赖 HEAD）。
+
+    只给 ``sparse`` 才走稀疏检出；普通的 ffmpeg / fdk-aac 仍走原来的浅克隆。
+    """
 
     url: str
     ref: Optional[str] = None
     commit: Optional[str] = None
+    depth: int = 1
+    sparse: Tuple[str, ...] = ()
+    partial: bool = True
 
 
 @dataclass(frozen=True)
@@ -269,7 +282,9 @@ class SourceManager:
 
         if isinstance(spec, GitSource):
             self.logger.info(f"git {spec.url} @ {spec.commit or spec.ref or 'HEAD'}")
-            if spec.commit:
+            if spec.sparse:
+                self._git_sparse_clone(spec, dest)
+            elif spec.commit:
                 dest.mkdir(parents=True, exist_ok=True)
                 self.runner.run(["git", "init", "-q", "."], cwd=dest)
                 self.runner.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, quiet=True)
@@ -290,11 +305,52 @@ class SourceManager:
         _write_pin(dest / ".deps_pin", spec)
         return dest
 
+    def _git_sparse_clone(self, spec: GitSource, dest: Path) -> None:
+        """浅克隆 + 稀疏检出：只让 sparse 列出的目录落到工作区。
+
+        AMF 上游仓库带 ``Thirdparty/``（DeckLink SDK、预编译 ffmpeg-6.0 等，约 490MB），
+        而构建只要 ``amf/public/include``。三管齐下避免白下载：
+        ``--depth 1``（不要历史）+ ``--filter=blob:none``（blob 按需，sparse 之外的
+        字节根本不落地）+ ``sparse-checkout``（工作区不展开无关目录）。
+        """
+        depth = str(max(1, int(spec.depth or 1)))
+        dest.mkdir(parents=True, exist_ok=True)
+        self.runner.run(["git", "init", "-q", "."], cwd=dest)
+        self.runner.run(["git", "remote", "remove", "origin"], cwd=dest, check=False, quiet=True)
+        self.runner.run(["git", "remote", "add", "origin", spec.url], cwd=dest, check=False, quiet=True)
+        # 传统（非 cone）模式：写 .git/info/sparse-checkout 即可，不要求先有 commit；
+        # cone 模式的 `git sparse-checkout init` 在空仓库（无 HEAD）里会失败
+        self.runner.run(["git", "config", "core.sparseCheckout", "true"], cwd=dest, quiet=True)
+        self.runner.run(["git", "config", "core.sparseCheckoutCone", "false"], cwd=dest, quiet=True)
+        info = ensure_dir(dest / ".git" / "info")
+        (info / "sparse-checkout").write_text(
+            "".join(f"/{p.strip('/')}/\n" for p in spec.sparse), encoding="utf-8")
+
+        refspec = spec.commit or spec.ref or "HEAD"
+        args = ["git", "fetch", "--depth", depth]
+        if spec.partial:
+            args.append("--filter=blob:none")
+        result = self.runner.run(args + ["origin", refspec], cwd=dest,
+                                 log_name="git-fetch", check=False)
+        if result.returncode != 0 and spec.partial:
+            # 老服务器/自建镜像可能没开 uploadpack.allowFilter，退回普通浅克隆（仍只拉一版）
+            self.logger.warn("--filter=blob:none 不被服务器支持，退回普通浅克隆")
+            result = self.runner.run(["git", "fetch", "--depth", depth, "origin", refspec],
+                                     cwd=dest, log_name="git-fetch", check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"git fetch 失败: {spec.url} @ {refspec}")
+        self.runner.run(["git", "checkout", "-q", "-f", "FETCH_HEAD"], cwd=dest)
+
 
 def _pin_of(spec) -> Dict[str, object]:
     """把源码描述压缩成可比较的锁定信息（写入源码目录，用于校验一致性）。"""
     if isinstance(spec, GitSource):
-        return {"kind": "git", "url": spec.url, "ref": spec.ref, "commit": spec.commit}
+        pin: Dict[str, object] = {"kind": "git", "url": spec.url,
+                                  "ref": spec.ref, "commit": spec.commit}
+        if spec.sparse:
+            # 稀疏路径变了必须重拉（否则工作区里缺目录，构建期才发现）
+            pin["sparse"] = list(spec.sparse)
+        return pin
     if isinstance(spec, ArchiveSource):
         return {"kind": "archive", "url": spec.url, "sha256": spec.sha256,
                 "strip_components": spec.strip_components}

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config as C
-from .utils import copy_tree, ensure_dir, which
+from .utils import copy_tree, ensure_dir, which, write_version_file
 
 # 当前正在构建的库名（供 cmake_* 辅助函数取 install prefix 与日志名）
 CURRENT_LIB = {"name": ""}
@@ -436,6 +436,65 @@ def remove_tree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _warn_if_deps_are_broken(ctx, build_dir: Path) -> None:
+    """构建后体检：ffmpeg 的 ``.d`` 依赖文件是否生成成功。
+
+    空 ``.d`` 不会让本次构建出错（配置一致性已由 ``_ensure_build_dir`` 兜底），
+    但意味着 make 感知不到头文件变化 —— 增量构建时改头文件不会触发重编。
+    静默存在容易让人误判"改了配置怎么没生效"，所以明确告警一次。
+    """
+    if ctx.platform != "windows":
+        return
+    total = empty = 0
+    for dep in build_dir.rglob("*.d"):
+        total += 1
+        try:
+            if dep.stat().st_size == 0:
+                empty += 1
+        except OSError:
+            continue
+    if total and empty * 2 > total:
+        ctx.logger.warn(f"ffmpeg 依赖文件不可用（{empty}/{total} 个 .d 为空）：make 感知不到"
+                        f" config.h/头文件变化，增量构建可能不重编。"
+                        f" 根治办法：给 VS 装 English Language Pack（或用 VSLANG=1033 生效的环境）；"
+                        f" 当前靠 configure 指纹兜底（参数变了会全量重编），必要时用 --clean")
+
+
+def _ensure_build_dir(work_dir: Path, configure_args: List[str], ctx) -> Path:
+    """按 configure 命令行做指纹：变了就重建中间目录（全量重编）。
+
+    保险丝。ffmpeg 靠 ``.d`` 依赖文件感知 ``config.h`` 变化，而 MSVC 下这些依赖
+    文件经常是 0 字节（cl 的 ``-showIncludes`` 输出被中文本地化，ffbuild/common.mak
+    的 sed 只认英文 ``Note: including file:``，见 toolchains.py 的 ``VSLANG``）。
+    依赖失效时 make 只会重编"缺失 / 被强制失效"的目标，于是出现
+    **配置改了、产物却只更新了一半**（编码器已进 DLL，ffmpeg.exe 里打印的
+    configuration 串还是旧的）。用命令行指纹兜底，保证"配置即产物"。
+    """
+    marker = work_dir / ".configure_args"
+    current = "\n".join(configure_args)
+    previous = ""
+    if marker.is_file():
+        try:
+            previous = marker.read_text(encoding="utf-8")
+        except OSError:
+            previous = ""
+    # --dry-run 只是"看看会执行什么"，绝不能顺手把中间目录删掉（曾经就是这么踩的）
+    dry_run = bool(getattr(ctx, "dry_run", False)
+                   or getattr(getattr(ctx, "runner", None), "dry_run", False))
+    if previous and previous != current:
+        ctx.logger.info("ffmpeg configure 参数变了，重建中间目录（全量重编）："
+                        "避免 make 只重编一部分导致配置与产物不一致")
+        if not dry_run:
+            remove_tree(work_dir)
+    build_dir = ensure_dir(work_dir / "build")
+    if not dry_run:
+        try:
+            marker.write_text(current, encoding="utf-8")
+        except OSError:
+            pass
+    return build_dir
+
+
 def build_ffmpeg(ctx, abi: str) -> Path:
     _set_current("ffmpeg")
     stage = ensure_dir(ctx.stage_dir("ffmpeg", abi))
@@ -458,7 +517,13 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     env = ctx.toolchain.build_env(abi)
     separator = getattr(ctx.toolchain, "shell_path_separator", os.path.sep)
     to_path = ctx.toolchain.msys_path if ctx.platform == "windows" else str
+    work_dir = ctx.work_dir("ffmpeg", abi)
     pkg_paths = [to_path(prefix / "lib" / "pkgconfig") for prefix in prefixes]
+    if ctx.enable_nvenc:
+        # nvenc 走 check_pkg_config：必须有带版本号的 ffnvcodec.pc，光给头文件 configure 会失败
+        pc_dir = hw_sdk_pkgconfig_dir(ctx, "nv-codec-headers", abi)
+        if pc_dir is not None:
+            pkg_paths.append(to_path(pc_dir))
     if env.get("PKG_CONFIG_PATH"):
         pkg_paths.append(env["PKG_CONFIG_PATH"])
     pkg_config_path = separator.join(pkg_paths)
@@ -468,17 +533,17 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     # 必须**源码外**构建：ffmpeg 是 in-source 编译，两个 profile 共用 sources/ffmpeg 时
     # 会互相踩到对方的 config.h 与 .o（曾出现 player 链接到 capture 的 random_seed.o、
     # 报 RAND_bytes 未解析）。放到 <profile>-<platform>-<abi>/ffmpeg/build 里各自独立。
-    work_dir = ctx.work_dir("ffmpeg", abi)
     if pruned:
         # 源码树刚被清理：旧目标文件对应的组件表已失效，且 allfilters.o/allcodecs.o
         # 只依赖同名 .c（不含 *_list.c），make 不会自动重编 → 必须重建中间目录
         ctx.logger.info("源码树有残留被清理，重建 ffmpeg 中间目录（全量重编）")
         remove_tree(work_dir)
-    build_dir = ensure_dir(work_dir / "build")
+    build_dir = _ensure_build_dir(work_dir, args, ctx)
     drop_component_list_objects(build_dir, ctx.logger)
     script = (f"export PKG_CONFIG_PATH='{pkg_config_path}' && {to_path(src / 'configure')} "
               + " ".join(args) + f" && make -j{ctx.jobs} && make install")
     ctx.toolchain.sh(script, cwd=build_dir, abi=abi, env=env, log_name=f"ffmpeg-{abi}")
+    _warn_if_deps_are_broken(ctx, build_dir)
 
     if ctx.platform == "windows":
         # MSVC 下 import lib 装在 bin/，同步一份到 lib/
@@ -507,8 +572,8 @@ def _verify_components(ctx, stage: Path) -> None:
     if not exe.exists():
         return
     wl = C.whitelist(getattr(ctx, "profile", ""))
-    wl = dict(wl, encoders=C.whitelist_encoders(ctx.platform, ctx.enable_nvenc,
-                                                getattr(ctx, "profile", "")),
+    wl = dict(wl, encoders=C.whitelist_encoders(ctx.platform, getattr(ctx, "profile", ""),
+                                                ctx.enable_nvenc, ctx.enable_amf),
               bsfs=C.whitelist_bsfs(getattr(ctx, "profile", "")))
     try:
         for key, flag in _COMPONENT_CHECKS:
@@ -547,17 +612,116 @@ def _dependency_prefixes(ctx, abi) -> List[Path]:
     return ready
 
 
+def prepare_hw_sdk(ctx, name: str, abi: str) -> Path:
+    """按锁定文件拉取桌面硬编 SDK，装到产物目录，返回可直接喂给 ``-I`` 的 include 目录。
+
+    头文件位置的取舍（沿用各 SDK 官方 ``make install`` 的布局，放在**自己的库目录**下）：
+
+        <输出>/amf/windows/include/AMF/...                     （AMD AMF SDK 官方布局）
+        <输出>/nv-codec-headers/windows/include/ffnvcodec/*.h  （nv-codec-headers 官方布局）
+        <输出>/nv-codec-headers/windows/lib/pkgconfig/ffnvcodec.pc
+        <输出>/<sdk>/windows/version-...txt                    （版本标记，可追溯 commit）
+
+    三条原则：
+      1. **不放进 ffmpeg/ 目录**——之前正是塞在 ffmpeg 的 include 里，整目录覆盖时被一起删掉；
+      2. 与 zlib/openssl 等库同一套 ``<库>/<平台>/{include,lib}`` 约定（平台层靠 platforms 限定为 windows）；
+      3. 上游仓库的目录结构不一定符合 ffmpeg 的写法（AMF 仓库里是
+         ``amf/public/include/{core,components}``，而 ffmpeg 写的是
+         ``#include <AMF/core/Version.h>``），安装时按 ``header_prefix`` 规整出
+         ``AMF/`` 这一层；上游源码目录保持原样不动。
+    """
+    spec = C.hw_sdk(name, ctx.platform)
+    if spec is None:
+        raise RuntimeError(f"{name}: 锁定文件未定义，或当前平台（{ctx.platform}）不使用该 SDK"
+                           f"（platforms={C.HW_SDKS.get(name, {}).get('platforms')}）")
+    src = ctx.sources.ensure(C.SDK_SOURCES[name], ctx.source_dir(name), ctx.force_fetch)
+    # 头文件与架构无关 -> 用 flat（不带 abi 层），多 ABI 构建共用同一份 <sdk>/<平台>/include
+    dest = ctx.install_dir(name)
+    include = ensure_dir(dest / "include")
+
+    include_src = src / (spec.get("include_dir") or ".")
+    prefix = spec.get("header_prefix") or ""
+    target = include / prefix if prefix else include
+    shutil.rmtree(target, ignore_errors=True)
+    copy_tree(include_src, target)
+
+    marker = spec.get("marker") or ""
+    if marker and not (include / marker).is_file():
+        raise RuntimeError(f"{name}: SDK 头文件布局不对，{include} 下找不到 {marker}")
+
+    # nv-codec-headers 官方会在 $(PREFIX)/lib/pkgconfig 装 ffnvcodec.pc（ffmpeg 靠它定位 SDK）
+    template_name = spec.get("pkgconfig_template") or ""
+    if template_name:
+        template = src / template_name
+        if template.is_file():
+            pc_dir = ensure_dir(dest / "lib" / "pkgconfig")
+            content = template.read_text(encoding="utf-8").replace("@@PREFIX@@", dest.as_posix())
+            (pc_dir / "ffnvcodec.pc").write_text(content, encoding="utf-8")
+
+    _write_sdk_marker(ctx, name, spec, dest, abi)
+    ctx.logger.info(f"{name} SDK -> {dest}")
+    return include
+
+
+def hw_sdk_pkgconfig_dir(ctx, name: str, abi: str) -> Optional[Path]:
+    """硬编 SDK 装好后的 pkgconfig 目录（ffmpeg 用 check_pkg_config 找 ffnvcodec）。"""
+    spec = C.hw_sdk(name, ctx.platform) or {}
+    if not spec.get("pkgconfig_template"):
+        return None
+    candidate = ctx.install_dir(name) / "lib" / "pkgconfig"
+    return candidate if candidate.is_dir() else None
+
+
+def _write_sdk_marker(ctx, name: str, spec: dict, dest: Path, abi: str) -> None:
+    """给 SDK 也写一份版本标记（与其它库同款文件名规则），便于追溯 commit/版本。"""
+    import platform as pl
+    from datetime import datetime
+    from .utils import build_marker_name, git_head_sha
+    commit = git_head_sha(ctx.source_dir(name))
+    now = datetime.now()
+    for stale in dest.glob("version-*.txt"):
+        stale.unlink()
+    marker = build_marker_name(name, spec.get("version") or "-", ctx.platform, abi,
+                               "header-only", commit=commit, when=now,
+                               variant=getattr(ctx.toolchain, "marker_variant", ""))
+    write_version_file(dest / marker, [
+        f"library    : {name}",
+        f"version    : {spec.get('version') or '-'}",
+        f"commit     : {commit or '-'}",
+        f"group      : {C.HW_SDK_GROUP}（构建期输入，非运行时库）",
+        f"summary    : {spec.get('note', '')}",
+        f"platform   : {ctx.platform} ({', '.join(ctx.abis)})",
+        f"platforms  : {', '.join(spec.get('platforms') or [])}",
+        f"compiler   : header-only",
+        f"layout     : {ctx.toolchain.layout_of(name)}",
+        f"build time : {now.isoformat(timespec='seconds')}",
+        f"build host : {pl.system()} {pl.machine()}",
+        f"source     : {ctx.source_dir(name)}",
+    ])
+
+
 def _ffmpeg_common_args(ctx, abi, stage: Path, prefixes) -> List[str]:
-    wl = C.whitelist(getattr(ctx, "profile", ""))
-    encoders = C.whitelist_encoders(ctx.platform, ctx.enable_nvenc, getattr(ctx, "profile", ""))
+    profile = getattr(ctx, "profile", "")
+    wl = C.whitelist(profile)
+    encoders = C.whitelist_encoders(ctx.platform, profile, ctx.enable_nvenc, ctx.enable_amf)
 
     def enable(option: str, key: str, values=None) -> List[str]:
         items = list(values) if values is not None else list(wl.get(key) or [])
         return [f"--enable-{option}={','.join(items)}"] if items else []
 
-    includes = " ".join(f"-I{p}/include" for p in prefixes)
+    # Windows 上 make 经 MSYS bash 执行，配方里的 -ID:\a\b 会被 shell 当转义吃掉
+    # （反斜杠被删除 -> -ID:ab），cl.exe 就找不到头；统一输出 D:/... 正斜杠形式，
+    # 与 pkg-config 给出的路径同款，cl.exe / link.exe 原生可识别。
+    to_include = (lambda p: Path(p).as_posix()) if ctx.platform == "windows" else str
+    includes = " ".join(f"-I{to_include(p)}/include" for p in prefixes)
+    # 硬编 SDK：按锁定文件拉取并装到 <输出>/<sdk>/<平台>/include，再经 -I 参与 configure
+    if ctx.enable_nvenc:
+        includes += f" -I{to_include(prepare_hw_sdk(ctx, 'nv-codec-headers', abi))}"
+    if ctx.enable_amf:
+        # configure 用 check_cpp_condition 验 AMF/core/Version.h，SDK 头必须在搜索路径里
+        includes += f" -I{to_include(prepare_hw_sdk(ctx, 'amf', abi))}"
     if ctx.platform == "windows":
-        libs = " ".join(f"-LIBPATH:{p}/lib" for p in prefixes)
+        libs = " ".join(f"-LIBPATH:{to_include(p)}/lib" for p in prefixes)
     else:
         libs = " ".join(f"-L{p}/lib" for p in prefixes)
         includes += " -ffunction-sections -fdata-sections"   # 配合最终链接的 --gc-sections
@@ -600,8 +764,17 @@ def _ffmpeg_platform_args(ctx, abi) -> List[str]:
                 "--enable-shared", "--disable-static",
                 # openssl 在 Windows 不装 .pc，静态链接所需系统库需显式给出
                 "--extra-libs='-lws2_32 -lgdi32 -lcrypt32 -ladvapi32 -luser32'"]
-        if ctx.enable_nvenc:
-            args.append("--enable-nvenc")
+        # 硬编开关与附加开关都来自锁定文件（extra_flags 里带 --enable-d3d11va：
+        # AMF 走 D3D11，采集链路本就是 D3D11/DXGI，直传显存帧时必须有它）
+        for enabled, name, fallback in ((ctx.enable_nvenc, "nv-codec-headers", "--enable-nvenc"),
+                                        (ctx.enable_amf, "amf", "--enable-amf")):
+            if not enabled:
+                continue
+            spec = C.hw_sdk(name, ctx.platform) or {}
+            args.append(spec.get("ffmpeg_flag") or fallback)
+            # extra_flags：--disable-everything 会把外部库(ffnvcodec)与 hwaccel(d3d11va)
+            # 一起关掉，必须显式补回来，否则硬编的依赖永远满足不了
+            args.extend(spec.get("extra_flags") or [])
         return args
 
     if ctx.platform == "android":

@@ -144,6 +144,51 @@
           "note": "锁 v1.14.1：MediaX 的 find_package(spdlog 1.14.1 REQUIRED) 与 ESLogger 基于此版本（上游最新 v1.17.0，升级需同步改 MediaX 侧）"
         }
       }
+    },
+
+    "ffmpeg_hw_sdks": {
+      "description": "桌面硬编 SDK：ffmpeg 的构建期输入（不是要编译的库）。只有 --enable-nvenc / --enable-amf 时才拉取；platforms 决定平台适用范围（目前只有 windows，iOS/Android 走 videotoolbox / mediacodec，不用这些 SDK）。头文件不安装到产物目录——运行期靠显卡驱动，不需要头文件",
+      "build_input_of": "ffmpeg",
+      "libraries": {
+        "amf": {
+          "kind": "git",
+          "version": "1.4.34",
+          "platforms": ["windows"],
+          "homepage": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF",
+          "url": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+          "tag": "v1.4.34",
+          "ref": "6d7bec0469961e2891c6e1aaa5122b76ed82e1db",
+          "commit": "6d7bec0469961e2891c6e1aaa5122b76ed82e1db",
+          "internal": false,
+          "depth": 1,
+          "partial": true,
+          "sparse": ["amf/public/include"],
+          "include_dir": "amf/public/include",
+          "header_prefix": "AMF",
+          "marker": "AMF/core/Version.h",
+          "ffmpeg_flag": "--enable-amf",
+          "extra_flags": ["--enable-d3d11va"],
+          "note": "AMD AMF：h264_amf / hevc_amf / av1_amf 编码器。直接用上游 GitHub 并锁 tag v1.4.34（ffmpeg 6.1 要求 AMF >= 1.4.29，该 tag 的 Version.h = 1.4.34.0）。仓库里头文件在 amf/public/include/{core,components}，没有 AMF/ 这一层；ffmpeg 写的是 #include <AMF/core/Version.h>，故构建时规整出 <out>/amf/windows/include/AMF/...。仓库自带 Thirdparty/（DeckLink SDK、预编译 ffmpeg-6.0 等约 490MB）只服务于 AMF 自己的 samples，构建用不到，因此 sparse 只检出 amf/public/include：--depth 1 + --filter=blob:none + sparse-checkout，其余内容连字节都不下载"
+        },
+        "nv-codec-headers": {
+          "kind": "git",
+          "version": "12.0.16.1",
+          "platforms": ["windows"],
+          "homepage": "https://github.com/FFmpeg/nv-codec-headers",
+          "url": "https://github.com/FFmpeg/nv-codec-headers.git",
+          "tag": "n12.0.16.1",
+          "ref": "451da99614412a7f9526ef301a5ee0c7a6f9ad76",
+          "commit": "451da99614412a7f9526ef301a5ee0c7a6f9ad76",
+          "internal": false,
+          "depth": 1,
+          "include_dir": "include",
+          "marker": "ffnvcodec/nvEncodeAPI.h",
+          "pkgconfig_template": "ffnvcodec.pc.in",
+          "ffmpeg_flag": "--enable-nvenc",
+          "extra_flags": ["--enable-ffnvcodec"],
+          "note": "NVIDIA nv-codec-headers：h264_nvenc / hevc_nvenc 编码器。直接用上游 GitHub，锁 tag n12.0.16.1（上游 tag 名带 n 前缀，commit 取剥壳后的 451da996；其 ffnvcodec.pc.in 与内网镜像逐字节一致）。该版本对应 Video Codec SDK 12.0.16，与 ffmpeg 6.1.6 匹配；升到 13.x 会抬高运行期驱动要求。仓库只有 include/ffnvcodec/*.h，无需 sparse。ffmpeg 用 check_pkg_config 找 ffnvcodec（要带版本号的 .pc），故构建时按 .pc.in 生成 ffnvcodec.pc（版本 12.0.16.1）；extra_flags 里的 --enable-ffnvcodec 不能省——--disable-everything 会连外部库 ffnvcodec 一起关掉，nvenc 的依赖就满足不了"
+        }
+      }
     }
   }
 }

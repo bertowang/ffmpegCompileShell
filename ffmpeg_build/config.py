@@ -106,9 +106,16 @@ def _load_deps() -> dict:
 DEPS = _load_deps()
 
 
+# 桌面硬编 SDK 单独一组：它不是"要编译的库"，而是 ffmpeg 的构建期输入，
+# 因此不进 DEPS_INDEX（不会出现在 --libs 列表里），由 hw_sdk() 单独解析。
+HW_SDK_GROUP = "ffmpeg_hw_sdks"
+
+
 def _iter_deps():
     """按 groups → [profiles] → libraries 展开，返回 (group, profile, name, spec)。"""
     for group_name, group in DEPS.get("groups", {}).items():
+        if group_name == HW_SDK_GROUP:      # 硬编 SDK 不是库，走 hw_sdk() 解析
+            continue
         profiles = group.get("profiles")
         if profiles:
             for profile_name, profile in profiles.items():
@@ -144,11 +151,18 @@ def dep_profile(name: str) -> str:
 
 
 def _source_for(spec: dict):
-    """按锁定文件条目构造源码描述：git 优先用 commit 锁定，其次 ref/tag。"""
+    """按锁定文件条目构造源码描述：git 优先用 commit 锁定，其次 ref/tag。
+
+    可选字段（给大仓库省流量/省时间）：``depth`` 浅克隆层数、``sparse`` 只检出
+    列出的子目录、``partial`` 配合 sparse 做按需下载（blob 不一次性拉全）。
+    """
     if spec.get("kind") == "git":
         return GitSource(spec["url"],
                          ref=spec.get("ref") or spec.get("tag") or "master",
-                         commit=spec.get("commit") or None)
+                         commit=spec.get("commit") or None,
+                         depth=int(spec.get("depth") or 1),
+                         sparse=tuple(spec.get("sparse") or ()),
+                         partial=bool(spec.get("partial", True)))
     return ArchiveSource(spec["url"],
                          strip_components=int(spec.get("strip_components", 1)),
                          sha256=spec.get("sha256") or None)
@@ -156,6 +170,29 @@ def _source_for(spec: dict):
 
 def dep_source(name: str):
     return _source_for(dep(name))
+
+
+# ------------------------------------------------- 桌面硬编 SDK（仅构建期输入）
+# 与 ffmpeg_deps 里那些"要编译的库"有三点不同：
+#   1) 按需：只有 --enable-nvenc / --enable-amf 时才拉取，默认完全不参与构建；
+#   2) 按平台：platforms 决定谁能用（目前只有 windows）。iOS/Android 走
+#      videotoolbox / mediacodec，且移动端对体积极敏感，桌面 SDK 绝不能带过去；
+#   3) 不安装：头文件只是构建期输入（运行期靠显卡驱动），不进产物目录，
+#      也就不会再出现"整目录覆盖 ffmpeg 的 include 时被一起删掉"的问题。
+HW_SDKS: Dict[str, dict] = dict(
+    (DEPS.get("groups", {}).get(HW_SDK_GROUP) or {}).get("libraries", {}) or {})
+SDK_SOURCES: Dict[str, object] = {name: _source_for(spec) for name, spec in HW_SDKS.items()}
+
+
+def hw_sdk(name: str, platform: str = "") -> Optional[dict]:
+    """取某平台可用的硬编 SDK 定义；该平台不用（platforms 不含它）则返回 None。"""
+    spec = HW_SDKS.get(name)
+    if not spec:
+        return None
+    platforms = spec.get("platforms") or []
+    if platform and platforms and platform not in platforms:
+        return None
+    return spec
 
 
 # OHOS 官方 ffmpeg 没有 OpenHarmony 媒体框架适配，故该平台改用 openharmony-tpc 的 fork
@@ -267,11 +304,32 @@ def whitelist_bsfs(profile: str = "") -> List[str]:
     return items
 
 
-def whitelist_encoders(platform: str, nvenc: bool = False, profile: str = "") -> List[str]:
+# 桌面独显硬编：NVENC(N 卡) / AMF(A 卡) 只有 Windows 有，靠 --enable-nvenc / --enable-amf 打开。
+# 移动端一律不带：既没有这些 SDK，也要为体积让路（移动端用的是各自平台的
+# h264_mediacodec / h264_videotoolbox，见 platform_encoders）。
+# 一旦放错平台，configure 会因为找不到 SDK 头而失败，不会静默编出半套。
+HARDWARE_ENCODERS: Dict[str, Dict[str, List[str]]] = {
+    "windows": {"nvenc": ["h264_nvenc"], "amf": ["h264_amf"]},
+}
+
+
+def whitelist_encoders(platform: str, profile: str = "", nvenc: bool = False,
+                       amf: bool = False) -> List[str]:
+    """某平台最终的编码器白名单（基础 + 平台编码器 + 桌面硬编）。
+
+    按平台取硬编是关键：移动端对体积极敏感，且没有 NVENC/AMF 的 SDK，
+    所以这里用平台查表，而不是"给了开关就无脑追加"。
+    """
     wl = whitelist(profile)
     encoders = list(wl["encoders"]) + list(wl["platform_encoders"].get(platform, []))
-    if nvenc and platform == "windows":
-        encoders.append("h264_nvenc")
+    # 播放链路不编码（encoders/platform_encoders 都为空），此时不能追加任何硬编
+    if not encoders:
+        return encoders
+    hw = HARDWARE_ENCODERS.get(platform, {})
+    if nvenc:
+        encoders += list(hw.get("nvenc") or [])
+    if amf:
+        encoders += list(hw.get("amf") or [])
     return encoders
 
 
@@ -347,6 +405,7 @@ class BuildContext:
     ffmpeg_ref: str = FFMPEG_REF
     ffmpeg_lto: bool = False
     enable_nvenc: bool = False
+    enable_amf: bool = False      # 硬编 SDK 的地址/版本在锁定文件里，按需拉取，不在本地维护
     profile: str = ACTIVE_PROFILE     # 用途（capture/player）：决定白名单、外部库开关、中间目录
     # Windows 运行时库：mt=/MT 静态（默认，与现有产物一致）；md=/MD 动态（给 /MD 的消费方，如 ESMediaX）
     crt: str = DEFAULT_CRT

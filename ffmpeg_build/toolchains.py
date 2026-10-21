@@ -287,6 +287,16 @@ class WindowsToolchain(Toolchain):
 
     def build_env(self, abi: str = "x64") -> Dict[str, str]:
         base = dict(self.msvc.env) if self.msvc else os.environ.copy()
+        # cl 的诊断信息会跟随系统语言：中文语言包下 -showIncludes 输出的是
+        # "注意: 包含文件:"，而 ffmpeg 的 ffbuild/common.mak 只按英文
+        # "Note: including file:" 做 sed 提取 —— 结果所有 C/C++ 的 .d 依赖文件都是
+        # 0 字节，make 感知不到 config.h 变化（曾出现"配置改了却只重编一部分"：
+        # DLL 有硬编、ffmpeg.exe 里的 configuration 串却是旧的）。
+        # VSLANG=1033 强制英文资源，依赖追踪即恢复正常。
+        # 实测：只装了中文语言包时 VSLANG 无效（cl 依旧输出"注意: 包含文件:"），
+        # 此时 .d 仍是空文件 —— 由 recipes._ensure_build_dir() 的 configure 指纹兜底，
+        # 保证"配置变了就全量重编"，不会出现配置与产物不一致。
+        base.setdefault("VSLANG", "1033")
         if self.msys2_bins:
             # MSVC 路径必须在前，MSYS2 只作为 GNU 工具补充（否则 cmake 会选到
             # /usr/bin/c++.exe，GNU link.exe 也会抢在 MSVC link.exe 之前）

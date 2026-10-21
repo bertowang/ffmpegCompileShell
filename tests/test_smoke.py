@@ -77,12 +77,139 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(sorted(FFMPEG_DEP_FLAGS),
                          ["--enable-libfdk-aac", "--enable-libopenh264", "--enable-libsrt",
                           "--enable-openssl", "--enable-zlib"])
-        # 平台编码器 + nvenc 只按 profile 追加
-        self.assertIn("h264_mediacodec", whitelist_encoders("android", False, "capture"))
-        self.assertEqual(whitelist_encoders("android", False, "player"), [])
-        self.assertIn("h264_nvenc", whitelist_encoders("windows", True, "capture"))
+        # 平台编码器按平台取：Android 只有 mediacodec，不会带上桌面硬编
+        self.assertIn("h264_mediacodec", whitelist_encoders("android", "capture"))
+        self.assertEqual(whitelist_encoders("android", "player"), [])
+        self.assertIn("h264_nvenc", whitelist_encoders("windows", "capture", nvenc=True))
         # 未知 profile 回落到开播，避免拼错时静默编出半套组件
         self.assertIs(whitelist("unknown"), capture)
+
+    def test_hardware_encoders_are_windows_only(self):
+        # 桌面独显硬编只在 Windows：移动端既没有 NVENC/AMF 的 SDK，也对体积极敏感，
+        # 因此即便开了开关也不能串到 android/ios 上
+        from ffmpeg_build.config import HARDWARE_ENCODERS, whitelist_encoders
+        self.assertEqual(set(HARDWARE_ENCODERS), {"windows"})
+        win = whitelist_encoders("windows", "capture", nvenc=True, amf=True)
+        self.assertIn("h264_nvenc", win)
+        self.assertIn("h264_amf", win)
+        self.assertIn("libopenh264", win)          # 软编回退始终保留
+        for platform in ("android", "ios", "ohos"):
+            enc = whitelist_encoders(platform, "capture", nvenc=True, amf=True)
+            self.assertNotIn("h264_nvenc", enc)
+            self.assertNotIn("h264_amf", enc)
+        # 没开开关时 Windows 也不带，保证默认构建不依赖 SDK
+        base = whitelist_encoders("windows", "capture")
+        self.assertNotIn("h264_nvenc", base)
+        self.assertNotIn("h264_amf", base)
+        # 播放器不编码
+        self.assertEqual(whitelist_encoders("windows", "player", nvenc=True, amf=True), [])
+
+    def test_hw_sdks_are_declared_per_platform(self):
+        # 硬编 SDK 必须在锁定文件里声明，并用 platforms 限定平台：
+        # windows 才有，ios/android 一律拿不到（移动端体积敏感 + 用不上）
+        from ffmpeg_build.config import HW_SDKS, SDK_SOURCES, hw_sdk
+        self.assertIn("amf", HW_SDKS)
+        self.assertIn("nv-codec-headers", HW_SDKS)
+        for name in HW_SDKS:
+            self.assertEqual(HW_SDKS[name].get("platforms"), ["windows"], name)
+            self.assertTrue(HW_SDKS[name]["url"].startswith("http"), name)
+            self.assertTrue(HW_SDKS[name].get("commit"), name)   # 必须锁 commit
+            self.assertIn(name, SDK_SOURCES)
+            self.assertIsNotNone(hw_sdk(name, "windows"), name)
+            for platform in ("android", "ios", "ohos"):
+                self.assertIsNone(hw_sdk(name, platform), f"{name}@{platform}")
+        # SDK 不是"要编译的库"，不能混进 --libs
+        self.assertNotIn("amf", LIBRARIES)
+        self.assertNotIn("nv-codec-headers", LIBRARIES)
+
+    def test_hw_sdk_sources_are_pinned_and_sparse(self):
+        # SDK 直接用上游仓库，但必须锁 tag：跟 master 会让版本漂移（AMF 已到 1.5.x、
+        # nv-codec-headers 有 12.0.16.2），构建就不可复现了
+        from ffmpeg_build.config import HW_SDKS, SDK_SOURCES
+        for name in ("amf", "nv-codec-headers"):
+            spec = HW_SDKS[name]
+            self.assertTrue(spec["url"].startswith("https://github.com/"), name)
+            self.assertTrue(spec.get("tag"), f"{name}: 必须锁 tag")
+            self.assertFalse(spec.get("internal"), name)
+            self.assertTrue(spec.get("commit"), f"{name}: 必须锁 commit")
+        # AMF 仓库带 Thirdparty/（DeckLink SDK、预编译 ffmpeg-6.0 等约 490MB），
+        # 只服务于它自己的 samples —— 全量 clone 是纯浪费，必须稀疏检出
+        amf = HW_SDKS["amf"]
+        src = SDK_SOURCES["amf"]
+        self.assertEqual(tuple(amf.get("sparse") or ()), ("amf/public/include",))
+        self.assertEqual(src.sparse, ("amf/public/include",))
+        self.assertEqual(src.depth, 1)
+        self.assertTrue(src.partial)
+        # 稀疏路径必须覆盖 include_dir，否则头文件检不出来，要到 configure 才炸
+        self.assertIn(amf["include_dir"], [p.strip("/") for p in amf["sparse"]])
+
+    def test_build_dir_is_rebuilt_when_configure_args_change(self):
+        # 保险丝：MSVC 下 ffmpeg 的 .d 依赖常是空文件，make 感知不到 config.h 变化，
+        # 会出现"配置改了却只重编一部分"（编码器进了 DLL，exe 里的 configuration 串却是旧的）。
+        # 故按 configure 命令行做指纹：变了就整个中间目录重建。
+        import tempfile
+        from types import SimpleNamespace
+        from ffmpeg_build.recipes import _ensure_build_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "ffmpeg"
+            ctx = SimpleNamespace(logger=Logger(verbose=False))
+            first = ["--prefix=/x", "--enable-encoder=h264_nvenc"]
+            build = _ensure_build_dir(work, first, ctx)
+            self.assertEqual(build, work / "build")
+            stale = build / "ffmpeg.o"
+            stale.write_text("old")
+
+            # 参数没变 -> 增量，旧目标文件保留
+            _ensure_build_dir(work, first, ctx)
+            self.assertTrue(stale.is_file())
+
+            # 参数变了 -> 全量，旧目标文件必须被清掉
+            changed = first + ["--enable-amf"]
+            _ensure_build_dir(work, changed, ctx)
+            self.assertFalse(stale.exists())
+            self.assertTrue((work / "build").is_dir())
+            self.assertEqual((work / ".configure_args").read_text(encoding="utf-8"),
+                             "\n".join(changed))
+
+            # --dry-run 只打印将要执行的命令，绝不能顺手把中间目录删掉
+            keep = work / "build" / "ffmpeg.o"
+            keep.write_text("keep")
+            _ensure_build_dir(work, ["--prefix=/other"],
+                              SimpleNamespace(logger=Logger(verbose=False), dry_run=True))
+            self.assertTrue(keep.is_file())
+
+    def test_prepare_hw_sdk_install_layout(self):
+        # SDK 头文件按官方 install 布局装进**自己的**库目录（<库>/<平台>/include）：
+        # 上游没有 AMF/ 这一层，要规整出来；且绝不能装进 ffmpeg/ 里（会被整目录覆盖删掉）
+        import tempfile
+        from types import SimpleNamespace
+        from ffmpeg_build.recipes import prepare_hw_sdk
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            (src / "amf" / "public" / "include" / "core").mkdir(parents=True)
+            (src / "amf" / "public" / "include" / "core" / "Version.h").write_text("#define X 1")
+            install = root / "out" / "amf" / "windows"
+
+            def make_ctx(platform):
+                return SimpleNamespace(
+                    platform=platform, force_fetch=False, abis=["x64"],
+                    logger=Logger(verbose=False),
+                    source_dir=lambda name: src,
+                    sources=SimpleNamespace(ensure=lambda *a, **k: src),
+                    install_dir=lambda name, abi=None: root / "out" / name / platform,
+                    toolchain=SimpleNamespace(layout_of=lambda n: "flat", marker_variant="crtmt"))
+
+            out = prepare_hw_sdk(make_ctx("windows"), "amf", "x64")
+            self.assertEqual(out, install / "include")
+            self.assertTrue((install / "include" / "AMF" / "core" / "Version.h").is_file())
+            # 上游源码保持原样，不做就地改写
+            self.assertTrue((src / "amf" / "public" / "include" / "core" / "Version.h").is_file())
+            # 版本标记与其他库同款
+            self.assertEqual(len(list(install.glob("version-*.txt"))), 1)
+            # 平台不匹配：直接报错，而不是悄悄编出没有硬编的版本
+            with self.assertRaises(RuntimeError):
+                prepare_hw_sdk(make_ctx("android"), "amf", "arm64-v8a")
 
     def test_auto_bsfs_always_enabled(self):
         # avformat 会自动插入 extract_extradata（flvenc 的 h264、demux 缺 extradata 时），

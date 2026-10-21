@@ -1,10 +1,16 @@
 # FfmpegCompileShell
 
 编译 **ffmpeg 及其依赖库** 的跨平台脚本（Python 3.8+，仅用标准库，零第三方依赖）。
+开播（capture）/ 播放（player）两套 profile；Windows 可选编入桌面硬编 `h264_nvenc` / `h264_amf`
+（SDK 按锁定文件自动从上游拉取，见 [1.4](#14-windows-硬编nvenc--amf)）。
 
 ## 目录
 
 - [1. 依赖库清单](#1-依赖库清单)
+  - [1.1 依赖锁定文件 `config/capture_deps.json`](#11-依赖锁定文件-configcapturedepsjson)
+  - [1.2 profile：开播(capture) 与 播放(player)](#12-profile开播capture-与-播放player)
+  - [1.3 Windows 运行时库 `--crt mt|md`](#13-windows-运行时库---crt-mtmd)
+  - [1.4 Windows 硬编：NVENC / AMF](#14-windows-硬编nvenc--amf)
 - [2. 产物输出目录（必填）](#2-产物输出目录必填)
 - [3. 使用攻略](#3-使用攻略)
   - [3.1 Windows](#31-首次使用windows)
@@ -42,7 +48,10 @@
 | json | 3.11.3 | nlohmann/json，header-only；MediaX 侧通常已由 `ESMediaX/3rd/json` submodule 提供，需要时 `--libs json` |
 | spdlog | v1.14.1 | C++ 日志库（编译型静态库）。只有 **MediaX** 需要：其 `ESLogger` 基于 spdlog 实现（android_sink / msvc_sink / OHOS hilog callback_sink + Windows Release 异步日志）；TGCapture 自带 `core/Logger.h`，不链。需要时 `--libs spdlog` |
 
-不使用 x264 / x265 / v265；AMF、nv-codec-headers、zlib、cuda-samples(NPP) 经复核均非开播编译期依赖，故不纳入。
+不使用 x264 / x265 / v265；cuda-samples(NPP) 经复核非开播编译期依赖，不纳入。
+
+**AMF 与 nv-codec-headers** 是 Windows 硬编（`h264_amf` / `h264_nvenc`）的**构建期输入**（只要头文件，
+不编译、运行期靠显卡驱动），默认不参与构建，需要时按 [1.4](#14-windows-硬编nvenc--amf) 打开开关。
 
 ### 1.1 依赖锁定文件 `config/capture_deps.json`
 
@@ -82,17 +91,20 @@ python build.py build --platform windows --deps D:/work/capture_deps.json ...   
              "commit": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1" }
 ```
 
-分三组（与 ffmpeg 的耦合关系）：
+分四组（与 ffmpeg 的耦合关系）：
 
 | 组 | 含义 | 库 |
 | - | - | - |
 | `ffmpeg` | FFmpeg 自身源码，按**用途(profile)**再分档 | `ffmpeg`（capture 文件里 profile=**capture**；player 文件里 profile=**player**） |
 | `ffmpeg_deps` | FFmpeg 的**构建期依赖**，需对应 `--enable-*`，产物静态并入 avcodec/avformat | `openssl`、`srt`、`fdk-aac`、`openh264` |
 | `standalone` | 与 FFmpeg **无关**的独立库，应用直接链接 | `libyuv`、`json`、`spdlog` |
+| `ffmpeg_hw_sdks` | 桌面**硬编 SDK**：FFmpeg 的构建期输入（头文件，不编译、不随产物分发） | `amf`、`nv-codec-headers`（仅 Windows + 显式开关，见 1.4） |
 
 规则：
 
 * **内网仓库**（`EST/media/e-ffmpeg`）：`ffmpeg`（ffmpeg-6.1.6）、`fdk-aac`（fdk_aac_v2.0.3）。
+* **硬编 SDK 用上游官方仓库并锁 tag**：`amf` → `GPUOpen-LibrariesAndSDKs/AMF` `v1.4.34`、
+  `nv-codec-headers` → `FFmpeg/nv-codec-headers` `n12.0.16.1`（两者都同时锁 commit，见 1.4）。
 * 其余库用**上游官方仓库**，取锁定日（`updated` 字段）的最新正式发布版；
   个别库为兼容 MediaX 会锁在旧版（如 `spdlog` 锁 v1.14.1，条目里有 `note` 说明原因）。
 * ffmpeg 的 `capture`（开播）标记会写进版本文件名，与将来的 `player` 产物区分：
@@ -115,8 +127,8 @@ python build.py build --platform windows --deps D:/work/capture_deps.json ...   
 | - | - | - |
 | 锁定文件 | `config/capture_deps.json` | `config/player_deps.json` |
 | 参与构建的库 | 9 个（含 **zlib**/openssl/srt/fdk-aac/openh264/libyuv） | 4 个（**zlib** / ffmpeg / json / spdlog） |
-| ffmpeg 外部库开关 | `--enable-zlib --enable-openssl --enable-libsrt --enable-libfdk-aac --enable-libopenh264`（**来自锁定文件 `ffmpeg_deps` 组的 `ffmpeg_flag`**，非硬编码） | `--enable-zlib`（png 解码依赖 zlib） |
-| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台硬编 / nvenc）、封装 `flv,mpegts`、解封装含 `image2`（水印图）、协议 `file,tcp,tls,http,https,rtmp,rtmps,libsrt` | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,mp4,flv,mkv,mpegts,hls`、协议 `file,http,tcp,hls` |
+| ffmpeg 外部库开关 | `--enable-zlib --enable-openssl --enable-libsrt --enable-libfdk-aac --enable-libopenh264`（**来自锁定文件 `ffmpeg_deps` 组的 `ffmpeg_flag`**，非硬编码）；开硬编时再追加 `--enable-ffnvcodec` / `--enable-d3d11va`（来自 `ffmpeg_hw_sdks` 组，见 1.4） | `--enable-zlib`（png 解码依赖 zlib） |
+| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台硬编：Android `h264_mediacodec`、iOS `h264_videotoolbox`、Windows 开开关后 `h264_nvenc`/`h264_amf`）、封装 `flv,mpegts`、解封装含 `image2`（水印图）、协议 `file,tcp,tls,http,https,rtmp,rtmps,libsrt` | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,mp4,flv,mkv,mpegts,hls`、协议 `file,http,tcp,hls` |
 
 两个白名单细节（都是踩过坑才改的）：
 
@@ -166,6 +178,68 @@ python build.py build --platform windows --crt md -o D:/work/3rd-md --libs spdlo
   `dumpbin /directives xxx.lib` 看 `RuntimeLibrary=MD_DynamicRelease` 还是 `MT_StaticRelease`，
   再与工程的 `MultiThreaded`/`MultiThreadedDLL`（Debug 为 `…Debug`/`…DebugDLL`）比对。
 
+### 1.4 Windows 硬编：NVENC / AMF
+
+Windows 开播除了软编 `libopenh264`，还可以编进**桌面独显硬编**（两者并存，上层按可用性选择，
+拿不到硬编时仍回退软编）：
+
+| 编码器 | 显卡 | 构建期需要的 SDK | 运行期依赖 |
+| - | - | - | - |
+| `h264_nvenc` | NVIDIA | `nv-codec-headers`（`ffnvcodec/nvEncodeAPI.h` + `ffnvcodec.pc`） | 驱动自带的 `nvEncodeAPI64.dll` |
+| `h264_amf` | AMD | `amf`（`AMF/core/*.h`、`AMF/components/*.h`） | 驱动/AMD 运行时自带的 `amfrt.dll` |
+
+**开关（默认都关）**：
+
+```powershell
+# 只编 ffmpeg，两个硬编都要
+python build.py build --platform windows -o D:/work/TGCapture3rd --libs ffmpeg -j 16 --enable-nvenc --enable-amf
+
+# 只要其中一个
+python build.py build --platform windows -o D:/work/TGCapture3rd --libs ffmpeg --enable-nvenc
+```
+
+编完自检（两个都应出现）：
+
+```powershell
+D:\work\TGCapture3rd\ffmpeg\windows\bin\ffmpeg.exe -hide_banner -encoders | findstr "h264_nvenc h264_amf"
+```
+
+要点：
+
+* **SDK 不用自备**，也不用 `--libs` 指定：锁定文件 `ffmpeg_hw_sdks` 组里写死了地址与版本，
+  开了开关就自动拉取；它们是"构建期输入"不是"要编译的库"，所以 `build.py list` 里看不到。
+* **来源与版本**：直接用上游 GitHub 并锁 tag —— `amf` 取 `v1.4.34`（FFmpeg 6.1 要求 `AMF >= 1.4.29`）、
+  `nv-codec-headers` 取 `n12.0.16.1`（对应 Video Codec SDK 12.0.16，与 ffmpeg 6.1.6 匹配）；
+  两个都同时锁 commit，升级只改锁定文件。
+* **AMF 仓库很大，已做提速**：上游仓库带 `Thirdparty/`（DeckLink SDK、预编译 ffmpeg-6.0 等约 490MB），
+  而构建只用 `amf/public/include`。因此走 `--depth 1` + `--filter=blob:none` + sparse-checkout，
+  实测落地 **1.45MB**，`Thirdparty/` 根本不下载（锁定文件里 `"sparse": ["amf/public/include"]`）。
+* **头文件落位**（各 SDK 官方 `make install` 布局，各自独立目录，**不塞进 `ffmpeg/`**，
+  避免整目录拷贝 ffmpeg 时被一起覆盖/删掉）：
+
+  ```
+  <输出>/amf/windows/include/AMF/...                       + version-…-amf-1.4.34-g6d7bec0-….txt
+  <输出>/nv-codec-headers/windows/include/ffnvcodec/*.h    + version-…-12.0.16.1-g451da99-….txt
+  <输出>/nv-codec-headers/windows/lib/pkgconfig/ffnvcodec.pc
+  ```
+
+  上游 AMF 仓库里没有 `AMF/` 这一层（是 `amf/public/include/{core,components}`），
+  FFmpeg 写的是 `#include <AMF/core/Version.h>`，安装时会规整出 `AMF/` 前缀。
+* **configure 上实际追加的开关**（来自锁定文件的 `ffmpeg_flag` + `extra_flags`）：
+
+  | 开关 | 追加 | 为什么 |
+  | - | - | - |
+  | `--enable-nvenc` | `--enable-ffnvcodec` | `--disable-everything` 会把**外部库 ffnvcodec** 一起关掉，不开则 `nvenc requested, but not all dependencies are satisfied` |
+  | `--enable-amf` | `--enable-d3d11va` | AMF 内部走 D3D11（`CONFIG_D3D11VA`），采集链路本就是 D3D11/DXGI；`--disable-everything` 同样会关掉这个 hwaccel |
+
+* **为什么移动端不加**：iOS/Android 分别用 `h264_videotoolbox` / `h264_mediacodec`
+  （`config.py::whitelist_encoders` 的 `platform_encoders`），它们不需要任何外部 SDK；
+  且移动端对体积极敏感，桌面硬编 SDK 与代码一律不带过去 —— 即使命令行给了
+  `--enable-nvenc --enable-amf`，非 Windows 平台也拿不到这两个编码器
+  （`HARDWARE_ENCODERS` 只登记了 `windows`）。
+* **运行期不需要随包任何 SDK 文件**：头文件只是编译期声明，实际编解码由显卡驱动提供；
+  所以不要把 `amf/` / `nv-codec-headers/` 拷进应用的 3rd 目录。
+
 ## 2. 产物输出目录（必填）
 
 `build` / `clean` 这类会往磁盘写产物的命令**必须**给出输出目录，二选一：
@@ -208,6 +282,8 @@ Android / iOS / OHOS 同样以 `PLATFORM_LAYOUT` 对齐 `3rd-bak`：
 | ios | `flat` + lipo 合并：**`<库>/ios/{include,lib}`（fat，无 abi 层）** | 对齐 `ffmpeg-capturer/ios/{include,lib}`、`libyuv/ios/{include,lib}` |
 
 * 布局表在 `config.WINDOWS_LAYOUT`，加新库时登记一行即可。
+* 硬编 SDK（`amf` / `nv-codec-headers`）同样是**无 abi 层的 flat**：`<库>/windows/{include,lib}`，
+  且只在开了 `--enable-amf` / `--enable-nvenc` 时才产出，属于构建期输入（见 1.4）。
 * flat / lib 布局没有 abi 层，`--abi x64,x86` 同时编会互相覆盖 → 检测到多 ABI 时自动改用 abi 目录并打印提示。
 * 其它平台（android/ohos 为 `<库>/<平台>/<abi>`，ios 为 fat 库无 abi 层）维持原样。
 
@@ -248,14 +324,16 @@ version-<abi>-<库>-<版本>-g<commit>-<构建时间>.<平台>[.<abi>][.<用途>
 
 ```
 TGCapture3rd/
-├── openssl/windows/x64/{include,lib,bin}
-├── srt/windows/x64/{include,lib}
-├── fdk-aac/windows/x64/{include,lib}
-├── openh264/windows/x64/{include,lib}
-├── libyuv/windows/x64/{include,lib}
-├── ffmpeg/windows/x64/{include,lib,bin}
-├── */android/arm64-v8a/...
-└── */ios/...                       # iOS 为 fat 库，不带 abi 层
+├── openssl/windows/{include,lib}
+├── srt/windows/{include,lib}
+├── fdk-aac/windows/{include,lib}
+├── openh264/windows/{include,lib}
+├── libyuv/windows/{include,lib}
+├── ffmpeg/windows/{include,lib,bin}
+├── amf/windows/include/AMF/...                # 仅 --enable-amf：构建期输入
+├── nv-codec-headers/windows/{include,lib}     # 仅 --enable-nvenc：构建期输入
+├── */android/<abi>/...
+└── */ios/...                                  # iOS 为 fat 库，不带 abi 层
 ```
 
 每个库目录下会生成一个**带完整信息的版本标记文件**，便于追溯：
@@ -286,10 +364,17 @@ python build.py fetch --platform windows
 # ③ 编译全部依赖 -> D:/work/TGCapture3rd（目录必填）
 python build.py build --platform windows -o D:/work/TGCapture3rd
 
+# ③' Windows 开播要硬编时（可选）：加 --enable-nvenc / --enable-amf，
+#     SDK 会按锁定文件自动从上游拉取，不用自备（详见 1.4）
+python build.py build --platform windows -o D:/work/TGCapture3rd --enable-nvenc --enable-amf
+
 # ④ 查看产物
 python build.py list
 dir D:\work\TGCapture3rd
 ```
+
+> 默认（不加开关）只编软编 `libopenh264`，产物最小；硬编 SDK 需要联网拉取，
+> 且只在 Windows 生效 —— iOS/Android 用 `h264_videotoolbox` / `h264_mediacodec`，无需 SDK。
 
 一键脚本：`powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1`
 
@@ -339,6 +424,7 @@ set OUT=D:/work/TGCapture3rd
 python build.py build --platform windows --libs openssl -o %OUT%   # 只编一个库
 python build.py build --platform windows --libs spdlog  -o %OUT%   # 可选库：MediaX 的日志实现
 python build.py build --platform windows --libs ffmpeg   -o %OUT%  # 依赖已就绪时单独重编 ffmpeg
+python build.py build --platform windows --libs ffmpeg   -o %OUT% --enable-nvenc --enable-amf  # 带硬编重编
 python build.py build --platform windows --clean         -o %OUT%  # 清理后全量重建
 python build.py clean --platform windows --all           -o %OUT%  # 只清理（含产物）
 python build.py build --platform windows -j 8            -o %OUT%  # 指定并发
@@ -358,7 +444,8 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 | `-j/--jobs` | 并行任务数 | CPU-1 |
 | `--toolchain` | Windows 工具链偏好 `auto`/`msvc`/`mingw` | `auto`（优先 MSVC） |
 | `--ffmpeg-ref` | ffmpeg 仓库分支/标签（不给则用 `config.py` 中的 ref） | 平台默认 |
-| `--enable-nvenc` | Windows 启用 NVENC（需自备 nv-codec-headers） | 关 |
+| `--enable-nvenc` | Windows 启用 `h264_nvenc`；`nv-codec-headers` 按锁定文件自动拉取（详见 1.4） | 关 |
+| `--enable-amf` | Windows 启用 `h264_amf`；AMF SDK 按锁定文件自动拉取，稀疏检出（详见 1.4） | 关 |
 | `--lto` | ffmpeg 开启 LTO（MSVC 下易踩坑） | 关 |
 | `--api` / `--min-version` | Android API / iOS 最低版本 | 21 / 12.0 |
 | `--ohos-sdk` | OHOS SDK 根目录（含 `native/`），不给则取 `$OHOS_SDK` | `$OHOS_SDK` |
@@ -371,10 +458,10 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 FfmpegCompileShell/
 ├── build.py                 CLI 入口
 ├── ffmpeg_build/
-│   ├── config.py            依赖清单、ffmpeg 裁剪白名单、路径、BuildContext
-│   ├── utils.py             日志 / 命令执行 / 下载解压 / 源码获取 / 文件工具
+│   ├── config.py            依赖清单、ffmpeg 裁剪白名单、硬编 SDK 定义、路径、BuildContext
+│   ├── utils.py             日志 / 命令执行 / 下载解压 / 源码获取（含浅克隆/稀疏检出）/ 文件工具
 │   ├── toolchains.py        Windows(MSVC) / Android(NDK) / iOS(Xcode) / OHOS(OpenHarmony SDK)
-│   ├── recipes.py           各库编译配方（一库一函数）
+│   ├── recipes.py           各库编译配方（一库一函数）+ 硬编 SDK 的拉取与头文件落位
 │   ├── bootstrap.py         工具链自检与自动补齐
 │   └── cli.py               list / bootstrap / fetch / build / clean
 ├── scripts/                 各平台一键入口
@@ -391,7 +478,8 @@ FfmpegCompileShell/
 
 开播是窄链路，采用 `--disable-everything` + 白名单，而非全量：
 
-* 只 enable：encoder `libopenh264,libfdk_aac,aac`（Android 加 `h264_mediacodec`，iOS 加 `h264_videotoolbox`）、
+* 只 enable：encoder `libopenh264,libfdk_aac,aac`（Android 加 `h264_mediacodec`，iOS 加 `h264_videotoolbox`，
+  Windows 开 `--enable-nvenc` / `--enable-amf` 后加 `h264_nvenc` / `h264_amf`）、
   decoder `h264,aac,png`、muxer `flv,mpegts`、demuxer `mov,flv,mp4`、parser `h264,aac`、
   bsf `h264_mp4toannexb,aac_adtstoasc,null`、filter `scale,format,aformat,aresample,overlay,null,anull`、
   protocol `file,tcp,tls,rtmp,rtmps,srt`
@@ -402,8 +490,14 @@ FfmpegCompileShell/
 * 非 MSVC 编译加 `-ffunction-sections -fdata-sections`，最终链接 .so 时配 `-Wl,--gc-sections`
 * OHOS 额外追加 `--enable-ohosavcodecdecoder`（见 `config.py::OHOS_FFMPEG_EXTRA_ARGS`）
 
-参考体积（Windows x64）：`avcodec-60.dll 2.49MB`、`avformat-60.dll 4.82MB`、`avutil-58.dll 4.41MB`、
-`swscale 0.59MB`、`avfilter 0.29MB`、`swresample 0.21MB`。
+* 开硬编时要记得**补回被 `--disable-everything` 一起关掉的东西**：外部库 `ffnvcodec`
+  （否则 `ERROR: nvenc requested, but not all dependencies are satisfied: ffnvcodec`）与
+  hwaccel `d3d11va`（AMF 内部走 D3D11）；这两个由锁定文件的 `extra_flags` 自动带上（见 1.4）
+
+参考体积（Windows x64，本次实测，含 `h264_nvenc` + `h264_amf` 与全部开播组件）：
+`avcodec-60.dll 2.61MB`、`avformat-60.dll 6.03MB`、`avutil-58.dll 4.92MB`、
+`swscale 0.59MB`、`avfilter 1.08MB`、`swresample 0.21MB`。
+两个硬编编码器只是"壳 + 动态加载"（真正的编解码在显卡驱动里），对 avcodec 的体积增量很小。
 
 ## 6. 环境要求与排错
 
@@ -426,6 +520,22 @@ OHOS SDK 无法自动下载（需 DevEco Studio / commandline-tools），`bootst
 * **`xxx not found using pkg-config`** → 脚本已处理（shell 内 export `PKG_CONFIG_PATH`、
   `.pc` 的 prefix 改写、openssl/srt 的库名与 .pc 归一化）。
 * **ffmpeg 装到了奇怪目录** → 脚本已处理（Windows 路径转 `/d/...` 传给 bash）。
+* **`amfenc.h(22): fatal error C1083: 无法打开包括文件 "AMF/core/Factory.h"`** →
+  Windows 下 `-I` 必须写成 `D:/...` 正斜杠：`make` 经 MSYS bash 执行，配方里的
+  `-ID:\a\b` 会被 shell 当转义吃掉（实测变成 `-ID:ab`），cl.exe 自然找不到头文件。
+  脚本已统一按正斜杠输出（其余库以前没暴露，是因为 pkg-config 另给了一份正斜杠路径，
+  AMF 没有 `.pc` 才踩到）。
+* **`ffmpeg -version` 的 `configuration` 串与实际能力不一致**（例如 DLL 里已有 `h264_amf`，
+  但 configuration 里没有 `--enable-amf`）→ 这两个字符串来自**不同的二进制**：
+  编码器列表在 `avcodec-60.dll`，configuration 串在 `ffmpeg.exe`。MSVC 下 ffmpeg 的
+  `.d` 依赖文件常常是 0 字节（cl 的 `-showIncludes` 输出被中文本地化，ffbuild 只认英文
+  `Note: including file:`），make 感知不到 `config.h` 变化 → **只重编了一部分**。
+  脚本已用"configure 命令行指纹"兜底（参数变了自动全量重编，见 `recipes.py::_ensure_build_dir`），
+  构建结束也会体检并告警；要彻底修好增量依赖，给 VS 装 English Language Pack。
+  已产出的旧产物用 `--clean` 重编一次即可对齐。
+* **硬编 SDK 拉取慢** → AMF 上游仓库带约 490MB 的 `Thirdparty/`；锁定文件已配
+  `--depth 1` + `--filter=blob:none` + sparse-checkout（只取 `amf/public/include`，实测 1.45MB）。
+  若自建镜像不支持 `--filter`，脚本会自动退回普通浅克隆并打印告警。
 * 每个阶段的完整输出在 `build/logs/<lib>-<abi>-<stage>.log`。
 
 ### 6.1 Windows CRT 必须一致（`/MT`）
@@ -480,6 +590,10 @@ Windows 的 ffmpeg 同时提供 `lib/*.lib`（import lib）与 `bin/*.dll`。
 
 * **CRT**：Windows 产物全是 `/MT`，MediaX 侧对应模块必须同为 `/MT`（详见 6.1）。
 * **spdlog**：MediaX 的 `ESLogger` 依赖编译型 spdlog，版本锁 `v1.14.1`，且需 `SPDLOG_COMPILED_LIB`（详见 6.1）。
+* **硬编（Windows）**：新版 `avcodec-60.dll` 已带 `h264_nvenc` / `h264_amf`；之前
+  `ESVideoEncoder.cpp` 找不到硬编会**静默回退** `libopenh264`，现在上层可以显式选硬编
+  （拿不到硬编时仍走软编回退）。运行期不需要随包任何 SDK 文件（编解码由显卡驱动提供），
+  因此**不要**把 `amf/` 或 `nv-codec-headers/` 拷进 `3rd`（详见 1.4）。
 
 ### 7.1 cuda-samples（NPP）：现状与将来建议
 

@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--ffmpeg-ref", default=None, help="ffmpeg 仓库分支/标签，默认用 config.py 中的 ref")
     p_build.add_argument("--lto", action="store_true", help="ffmpeg 开启 LTO（默认关闭）")
     p_build.add_argument("--enable-nvenc", action="store_true", help="Windows 启用 NVENC（需 nv-codec-headers）")
+    p_build.add_argument("--enable-amf", action="store_true",
+                         help="Windows 启用 AMF（SDK 按锁定文件自动拉取，仅 windows）")
+    # 说明：AMF / nv-codec-headers 的地址与版本锁定在 config/<profile>_deps.json 的
+    # ffmpeg_hw_sdks 组（platforms 限定 windows），构建时按需拉取，无需本地维护。
     p_build.set_defaults(func=cmd_build)
 
     p_clean = sub.add_parser("clean", help="清理中间产物（--all 时还需 --output）")
@@ -252,6 +256,7 @@ def make_context(args, logger: Logger, require_output: bool = True) -> BuildCont
         ffmpeg_ref=getattr(args, "ffmpeg_ref", None),
         ffmpeg_lto=getattr(args, "lto", False),
         enable_nvenc=getattr(args, "enable_nvenc", False),
+        enable_amf=getattr(args, "enable_amf", False),
         crt=(getattr(args, "crt", None) or DEFAULT_CRT).lower(),
     )
     ctx.logger = logger
