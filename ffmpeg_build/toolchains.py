@@ -529,7 +529,10 @@ class IOSToolchain(Toolchain):
         return env
 
     def cmake_args(self, abi: str) -> List[str]:
+        # iOS 交叉编译时 CMake 不会自动设 CMAKE_SYSTEM_PROCESSOR；而 libyuv 正是靠它决定
+        # 要不要编 row_neon64 / row_sve 等内核目标，不设则库里缺这些符号（链接报未定义）
         return ["-G", "Unix Makefiles", "-DCMAKE_SYSTEM_NAME=iOS",
+                f"-DCMAKE_SYSTEM_PROCESSOR={abi.replace('-simulator', '')}",
                 f"-DCMAKE_OSX_SYSROOT={self.sdk_name(abi)}",
                 f"-DCMAKE_OSX_ARCHITECTURES={abi.replace('-simulator', '')}",
                 f"-DCMAKE_OSX_DEPLOYMENT_TARGET={self.min_version}", "-DCMAKE_BUILD_TYPE=Release"]
