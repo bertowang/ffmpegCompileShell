@@ -388,7 +388,8 @@ python3 build.py bootstrap --platform android --install
 python3 build.py build --platform android --abi arm64-v8a --api 21 -o D:/work/TGCapture3rd
 ```
 
-脚本：`./scripts/build_ios.sh`、`./scripts/build_android.sh`
+脚本（输出目录同样必填：第二个参数，或环境变量 `FFMPEG_3RD_OUTPUT`，不给时默认 `../TGCapture3rd`）：
+`./scripts/build_ios.sh fat /path/to/TGCapture3rd`、`./scripts/build_android.sh`
 
 ### 3.3 OHOS（OpenHarmony）
 
@@ -505,7 +506,7 @@ FfmpegCompileShell/
 | - | - | - |
 | windows | Windows | VS 2022 Build Tools（MSVC）+ MSYS2（make/install/perl/nasm）+ cmake/ninja |
 | android | macOS / Linux | Android NDK r21+（可 `bootstrap --install` 自动下载 r27c）+ cmake + make |
-| ios | macOS | Xcode 命令行工具 + cmake + nasm（模拟器架构需要） |
+| ios | macOS | Xcode 命令行工具 + cmake + nasm（模拟器架构需要）+ pkg-config（ffmpeg configure 找 openssl/srt/fdk-aac/openh264 用） |
 | ohos | Linux / macOS（Windows 需 MSYS2/Git Bash） | DevEco Studio 或 commandline-tools 的 OHOS SDK（`$OHOS_SDK`）+ cmake + make + perl |
 
 OHOS SDK 无法自动下载（需 DevEco Studio / commandline-tools），`bootstrap --platform ohos` 只做检测并给出指引。
@@ -519,6 +520,8 @@ OHOS SDK 无法自动下载（需 DevEco Studio / commandline-tools），`bootst
 * **链接报 `__imp_xxx` 未解析** → CRT 混用；脚本已统一 `/MT`，不要单独改某个库的 CRT（见 6.1）。
 * **`xxx not found using pkg-config`** → 脚本已处理（shell 内 export `PKG_CONFIG_PATH`、
   `.pc` 的 prefix 改写、openssl/srt 的库名与 .pc 归一化）。
+  若报的是 **命令本身不存在**（macOS 默认没有 `pkg-config`），先 `brew install pkg-config`
+  再重跑；`bootstrap --platform ios/android --install` 会自动装。
 * **ffmpeg 装到了奇怪目录** → 脚本已处理（Windows 路径转 `/d/...` 传给 bash）。
 * **`amfenc.h(22): fatal error C1083: 无法打开包括文件 "AMF/core/Factory.h"`** →
   Windows 下 `-I` 必须写成 `D:/...` 正斜杠：`make` 经 MSYS bash 执行，配方里的

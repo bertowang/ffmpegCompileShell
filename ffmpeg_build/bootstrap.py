@@ -143,6 +143,9 @@ def _check_ios() -> List[ToolStatus]:
         ToolStatus("Xcode", bool(xcode), xcode, "xcode-select --install"),
         ToolStatus("cmake", bool(which("cmake")), which("cmake") or "", "brew install cmake"),
         ToolStatus("nasm", bool(which("nasm")), which("nasm") or "", "brew install nasm"),
+        # ffmpeg 的 configure 靠 pkg-config 找 openssl / srt / fdk-aac / openh264，
+        # 缺了不会在自检阶段暴露，而是拖到 configure 才报 "xxx not found using pkg-config"
+        ToolStatus("pkg-config", bool(which("pkg-config")), which("pkg-config") or "", "brew install pkg-config"),
     ]
 
 
@@ -229,7 +232,7 @@ def _install_ios(status: ToolStatus, logger: Logger, runner: CommandRunner) -> L
     if status.name == "Xcode":
         runner.run(["xcode-select", "--install"], check=False)
         return ["已触发 Xcode 命令行工具安装，完成后重试"]
-    package = {"cmake": "cmake", "nasm": "nasm"}.get(status.name)
+    package = {"cmake": "cmake", "nasm": "nasm", "pkg-config": "pkg-config"}.get(status.name)
     if package and which("brew"):
         runner.run(["brew", "install", package], check=False, log_name=f"brew-{package}")
         return [f"已执行 brew install {package}"]

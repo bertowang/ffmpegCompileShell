@@ -202,7 +202,13 @@ def build_openh264(ctx, abi: str) -> Path:
         script = (f"make -j{ctx.jobs} OS=linux ARCH={OHOS_ABI[abi]['openh264']} "
                   f"install-static PREFIX={stage}")
     else:
-        script = (f"make -j{ctx.jobs} OS=ios ARCH={abi.replace('-simulator', '')} "
+        arch = abi.replace('-simulator', '')
+        # openh264 是**源码内**编译：多 ABI 共用同一份源码时，上一架构留下的 .o 与 .a
+        # 会被 make 视为最新而直接复用，lipo 阶段报 cputype 不一致。每个 ABI 构建前先 clean。
+        if len(getattr(ctx, "abis", [abi])) > 1:
+            toolchain.sh(f"make OS=ios ARCH={arch} clean", cwd=src, abi=abi,
+                         log_name=f"openh264-{abi}-clean", check=False, quiet=True)
+        script = (f"make -j{ctx.jobs} OS=ios ARCH={arch} "
                   f"SDK_MIN={toolchain.min_version} install-static PREFIX={stage}")
 
     toolchain.sh(script, cwd=src, abi=abi, log_name=f"openh264-{abi}")

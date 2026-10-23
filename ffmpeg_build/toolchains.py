@@ -157,8 +157,9 @@ class Toolchain:
     # 路径 / 目录布局（对齐 MediaX/ESMediaX/3rd 的历史结构）
     def layout_of(self, lib: str) -> str:
         layout = platform_layout(self.name, lib)
-        # flat / lib 布局没有 abi 层，同时编多个 ABI 会互相覆盖 → 回落到 abi 目录
-        if layout != "abi" and len(self.ctx.abis) > 1:
+        # flat / lib 布局没有 abi 层，同时编多个 ABI 会互相覆盖 → 回落到 abi 目录。
+        # 但 fat 库平台（iOS）多架构是 lipo 合并后落在同一目录，本来就不分 abi，不能切。
+        if layout != "abi" and len(self.ctx.abis) > 1 and self.use_abi_dir:
             self.logger.info(f"[{lib}] 同时构建 {', '.join(self.ctx.abis)}，改用 abi 目录布局"
                              f"（{layout} 布局无 abi 层会互相覆盖）")
             return "abi"
