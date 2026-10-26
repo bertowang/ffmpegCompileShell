@@ -14,16 +14,17 @@ from . import bootstrap
 from . import deps_env  # noqa: F401  必须在 config 之前：预扫描 --deps/--profile/--config-dir
 from .config import (ACTIVE_PROFILE, BUILD_ORDER, CRT_OPTIONS, DEFAULT_CRT, DEPS_FILE, ENV_OUTPUT,
                      FFMPEG_DEP_FLAGS, OPTIONAL_LIBRARIES, BuildContext, LIBRARIES, dep_group,
-                     dep_profile, is_portable, resolve_output_root, resolve_selection, whitelist)
+                     dep_profile, dep_source, is_portable, resolve_output_root, resolve_selection, whitelist)
 from .recipes import REGISTRY
 from .toolchains import TOOLCHAINS, create_toolchain, normalize_platform
 from .utils import (CommandRunner, Logger, build_marker_name, git_head_sha,
                     static_lib_names, write_version_file)
 
-PLATFORM_HELP = ("目标平台: windows(本机 MSVC) / android(交叉编译) / ios(mac 编译) / "
-                 "ohos(OpenHarmony，需 OHOS SDK，Linux/macOS 宿主)")
-ABI_HELP = ("windows: x64/x86/arm64; android: arm64-v8a/armeabi-v7a/x86_64; "
-            "ios: arm64/x86_64/fat; ohos: arm64-v8a/armeabi-v7a/x86_64")
+PLATFORM_HELP = ("目标平台: windows(本机 MSVC) / linux(本机 gcc) / android(交叉编译) / "
+                 "ios(mac 编译) / ohos(OpenHarmony，需 OHOS SDK，Linux/macOS 宿主)")
+ABI_HELP = ("windows: x64/x86/arm64; linux: x86_64/arm64/armhf(默认取宿主架构); "
+            "android: arm64-v8a/armeabi-v7a/x86_64; ios: arm64/x86_64/fat; "
+            "ohos: arm64-v8a/armeabi-v7a/x86_64")
 
 
 # ------------------------------------------------------------------ 参数
@@ -170,7 +171,9 @@ def cmd_fetch(args, logger: Logger) -> int:
     ctx = make_context(args, logger, require_output=False)
     for name in _ordered(args.libs):
         logger.section(f"fetch {name}")
-        ctx.sources.ensure(LIBRARIES[name].source, ctx.source_dir(name), ctx.force_fetch)
+        # 按平台取源码：命中 platform_overrides 的库（如 OHOS 的 ffmpeg fork）
+        # 要在这一步就拉对，否则后面 build 会因锁定值不一致再拉一次
+        ctx.sources.ensure(dep_source(name, ctx.platform), ctx.source_dir(name), ctx.force_fetch)
     logger.info("源码已就绪")
     return 0
 
@@ -201,7 +204,7 @@ def cmd_build(args, logger: Logger) -> int:
     for name in libraries:
         started = time.time()
         logger.section(f"build {name} {LIBRARIES[name].version}")
-        ctx.sources.ensure(LIBRARIES[name].source, ctx.source_dir(name), ctx.force_fetch)
+        ctx.sources.ensure(dep_source(name, ctx.platform), ctx.source_dir(name), ctx.force_fetch)
         stages = {}
         for abi in ctx.abis:
             logger.step(f"{name} [{abi}] 开始编译")

@@ -32,6 +32,8 @@ class ToolStatus:
     found: bool
     path: str = ""
     hint: str = ""
+    # 可选工具：缺了不阻断构建，配方会自动降级（如无 nasm 时关掉 x86 汇编）
+    optional: bool = False
 
     @property
     def mark(self) -> str:
@@ -45,7 +47,11 @@ class CheckResult:
 
     @property
     def missing(self) -> List[ToolStatus]:
-        return [s for s in self.statuses if not s.found]
+        return [s for s in self.statuses if not s.found and not s.optional]
+
+    @property
+    def optional_missing(self) -> List[ToolStatus]:
+        return [s for s in self.statuses if not s.found and s.optional]
 
 
 def tools_root() -> Path:
@@ -61,6 +67,8 @@ def check(platform: str, logger: Logger, ctx=None) -> CheckResult:
         result.statuses = _check_android(ctx)
     elif platform == "ohos":
         result.statuses = _check_ohos(ctx)
+    elif platform == "linux":
+        result.statuses = _check_linux()
     else:
         result.statuses = _check_ios()
     return result
@@ -135,6 +143,29 @@ def _ohos_sdk_cmake(sdk: str) -> str:
     return str(candidate) if candidate.exists() else ""
 
 
+def _check_linux() -> List[ToolStatus]:
+    """本机 Linux：gcc/clang + make + cmake + pkg-config + perl，nasm 可选。"""
+    on_linux = pl.system() == "Linux"
+    cc = which("gcc") or which("clang") or which("cc") or ""
+    asm = which("nasm") or which("yasm") or ""
+    return [
+        ToolStatus("Linux 宿主", on_linux, pl.platform(), "Linux 产物需在 Linux 上构建"),
+        ToolStatus("gcc/clang", bool(cc), cc, "dnf install -y gcc gcc-c++ / apt install -y build-essential"),
+        ToolStatus("cmake", bool(which("cmake")), which("cmake") or "",
+                   "srt/fdk-aac/zlib/libyuv 用 CMake 构建：dnf install -y cmake / apt install -y cmake"),
+        ToolStatus("make", bool(which("make")), which("make") or "",
+                   "openssl/openh264/ffmpeg 需要 GNU make：dnf install -y make / apt install -y make"),
+        # ffmpeg 的 configure 靠 pkg-config 找 openssl / srt / fdk-aac / openh264，
+        # 缺了不会在自检阶段暴露，而是拖到 configure 才报 "xxx not found using pkg-config"
+        ToolStatus("pkg-config", bool(which("pkg-config")), which("pkg-config") or "",
+                   "dnf install -y pkgconf-pkg-config / apt install -y pkg-config"),
+        ToolStatus("perl", bool(which("perl")), which("perl") or "",
+                   "openssl 的 Configure 需要 perl：dnf install -y perl / apt install -y perl"),
+        ToolStatus("nasm", bool(asm), asm,
+                   "x86 汇编（ffmpeg/openh264）需要；缺失时自动 --disable-x86asm", optional=True),
+    ]
+
+
 def _check_ios() -> List[ToolStatus]:
     on_mac = pl.system() == "Darwin"
     xcode = _run(["xcode-select", "-p"]) if on_mac else ""
@@ -152,9 +183,12 @@ def _check_ios() -> List[ToolStatus]:
 def report(result: CheckResult, logger: Logger) -> None:
     logger.section(f"{result.platform} 工具链自检")
     for status in result.statuses:
-        logger.info(f"{status.mark} {status.name:<22} {status.path}")
+        note = "（可选，缺失会自动降级）" if (status.optional and not status.found) else ""
+        logger.info(f"{status.mark} {status.name:<22} {status.path}{note}")
     for status in result.missing:
         logger.warn(f"缺少 {status.name}: {status.hint}")
+    for status in result.optional_missing:
+        logger.warn(f"可选工具缺失 {status.name}: {status.hint}")
     if not result.missing:
         logger.info("工具链完整，可以开始编译")
 
@@ -171,6 +205,8 @@ def install(platform: str, result: CheckResult, logger: Logger, runner: CommandR
             actions += _install_android(status, logger, tools)
         elif platform == "ohos":
             actions += _install_ohos(status)
+        elif platform == "linux":
+            actions += _install_linux(status)
         else:
             actions += _install_ios(status, logger, runner)
     return actions
@@ -224,6 +260,14 @@ def _install_android(status: ToolStatus, logger: Logger, tools: Path) -> List[st
 def _install_ohos(status: ToolStatus) -> List[str]:
     """OHOS SDK 只能由 DevEco Studio / commandline-tools 下载，这里只给指引。"""
     return [f"{status.name} 缺失：{status.hint}"]
+
+
+def _install_linux(status: ToolStatus) -> List[str]:
+    """只给安装命令：装包需要 root，脚本不代劳（避免半途卡在 sudo 密码上）。"""
+    packages = {"gcc/clang": "gcc gcc-c++", "cmake": "cmake", "make": "make",
+                "pkg-config": "pkgconf-pkg-config", "perl": "perl", "nasm": "nasm"}
+    package = packages.get(status.name, status.name)
+    return [f"{status.name} 缺失：dnf install -y {package}（或 apt install -y {package}）"]
 
 
 def _install_ios(status: ToolStatus, logger: Logger, runner: CommandRunner) -> List[str]:

@@ -35,6 +35,16 @@
                   "ref": "ohos-n6.1.2_dev",
                   "commit": "",
                   "note": "OHOS 需 openharmony-tpc 的 fork（--enable-ohosavcodecdecoder 仅该分支有）"
+                },
+                "linux": {
+                  "kind": "git",
+                  "version": "6.1.6",
+                  "url": "https://github.com/FFmpeg/FFmpeg.git",
+                  "tag": "n6.1.6",
+                  "ref": "n6.1.6",
+                  "commit": "f1e3a2bf7a2f2cde936d1ed97f09a26853d20125",
+                  "internal": false,
+                  "note": "内网 git.woa.com 需要工蜂鉴权，Linux 构建机上改用上游官方仓库的同版本 n6.1.6；9266ee0 是 n6.1.6 的附注标签对象，真正的发布 commit 是 f1e3a2b，故锁定后者"
                 }
               },
               "note": "示例文件：ffmpeg 配方当前仍是开播开关（--enable-openssl/libfdk-aac/libopenh264/libsrt）与开播白名单，播放器真正开编前需先补 player 的裁剪白名单与 configure 开关"
@@ -43,7 +53,6 @@
         }
       }
     },
-
     "ffmpeg_deps": {
       "description": "播放器 FFmpeg 的构建期依赖：png 解码器（封面/水印图）依赖 zlib",
       "build_input_of": "ffmpeg",
@@ -62,7 +71,6 @@
         }
       }
     },
-
     "standalone": {
       "description": "与 FFmpeg 无关的独立库：不参与 FFmpeg 构建，由应用直接链接（或 header-only 直接包含）",
       "build_input_of": null,
@@ -70,7 +78,9 @@
         "json": {
           "kind": "archive",
           "layout": "portable",
-          "output_subdirs": ["single_include"],
+          "output_subdirs": [
+            "single_include"
+          ],
           "version": "3.12.0",
           "homepage": "https://github.com/nlohmann/json",
           "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/include.zip",

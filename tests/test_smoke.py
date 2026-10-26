@@ -14,7 +14,8 @@ from ffmpeg_build.config import (BUILD_ORDER, DEPS_FILE, DEPS_LIBRARIES, LIBRARI
                                  OPTIONAL_LIBRARIES, PROJECT_ROOT, dep_group, dep_profile,
                                  resolve_output_root, resolve_selection)
 from ffmpeg_build.recipes import REGISTRY
-from ffmpeg_build.toolchains import OHOS_ABI, OHOSToolchain, TOOLCHAINS, normalize_platform
+from ffmpeg_build.toolchains import (LINUX_ABI, OHOS_ABI, OHOSToolchain, LinuxToolchain,
+                                     TOOLCHAINS, normalize_platform)
 from ffmpeg_build.utils import Logger
 
 FORBIDDEN = ("x264", "x265", "v265")
@@ -247,16 +248,20 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(ffmpeg["commit"], DEPS_LIBRARIES["ffmpeg"]["commit"])
 
     def test_deps_file_selectable(self):
+        # 用真实临时目录而不是 "D:/cfg"：后者在 POSIX 上会被当成相对路径解析到工程目录，
+        # 导致测试只能在 Windows 上通过。
+        import tempfile
         from ffmpeg_build import deps_env
         saved = {k: os.environ.get(k) for k in (deps_env.ENV_DEPS_FILE, deps_env.ENV_PROFILE,
                                                 deps_env.ENV_CONFIG_DIR)}
+        cfg = Path(tempfile.mkdtemp()).resolve()
         try:
-            deps_env.apply_from_argv(["build", "--platform", "windows", "--config-dir", "D:/cfg"])
-            self.assertEqual(deps_env.deps_file(), Path("D:/cfg/capture_deps.json"))
-            deps_env.apply_from_argv(["build", "--platform", "windows", "--profile", "player"])
-            self.assertEqual(deps_env.deps_file(), Path("D:/cfg/player_deps.json"))
-            deps_env.apply_from_argv(["build", "--platform", "windows", "--deps", "D:/x/my.json"])
-            self.assertEqual(deps_env.deps_file(), Path("D:/x/my.json"))
+            deps_env.apply_from_argv(["build", "--platform", "linux", "--config-dir", str(cfg)])
+            self.assertEqual(deps_env.deps_file(), cfg / "capture_deps.json")
+            deps_env.apply_from_argv(["build", "--platform", "linux", "--profile", "player"])
+            self.assertEqual(deps_env.deps_file(), cfg / "player_deps.json")
+            deps_env.apply_from_argv(["build", "--platform", "linux", "--deps", str(cfg / "my.json")])
+            self.assertEqual(deps_env.deps_file(), cfg / "my.json")
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None)
@@ -273,11 +278,88 @@ class ConfigTest(unittest.TestCase):
 
 class PlatformTest(unittest.TestCase):
     def test_platforms(self):
-        self.assertEqual(set(TOOLCHAINS), {"windows", "android", "ios", "ohos"})
+        self.assertEqual(set(TOOLCHAINS), {"windows", "android", "ios", "ohos", "linux"})
 
     def test_aliases(self):
         self.assertEqual(normalize_platform("openharmony"), "ohos")
         self.assertEqual(normalize_platform("win64"), "windows")
+        self.assertEqual(normalize_platform("linux64"), "linux")
+
+    def test_every_platform_has_layout_and_default(self):
+        # 新增平台时最容易漏的两张表：PLATFORM_LAYOUT 与 DEFAULT_PLATFORM_LAYOUT。
+        # 漏了会让 install_dir 静默回落到 "abi"，产物目录与文档不一致。
+        from ffmpeg_build.config import DEFAULT_PLATFORM_LAYOUT, PLATFORM_LAYOUT
+        self.assertEqual(set(PLATFORM_LAYOUT), set(TOOLCHAINS))
+        self.assertEqual(set(DEFAULT_PLATFORM_LAYOUT), set(TOOLCHAINS))
+
+
+class LinuxTest(unittest.TestCase):
+    """Linux 工具链：本机 gcc/clang + GNU make，验证路径/环境/参数拼装。"""
+
+    def _context(self):
+        ctx = SimpleNamespace(logger=Logger(verbose=False), runner=None,
+                              abis=["x86_64"], output_root=Path("out"), platform="linux")
+        tc = LinuxToolchain(ctx)
+        ctx.toolchain = tc
+        return ctx, tc
+
+    def test_abi_table(self):
+        self.assertEqual(set(LINUX_ABI), {"x86_64", "arm64", "armhf"})
+
+    def test_build_env(self):
+        _, tc = self._context()
+        env = tc.build_env("x86_64")
+        self.assertEqual(env["CC"], tc.cc)
+        self.assertIn("-fPIC", env["CFLAGS"])
+
+    def test_cmake_args_and_install_dir(self):
+        _, tc = self._context()
+        self.assertIn("-DCMAKE_BUILD_TYPE=Release", tc.cmake_args("x86_64"))
+        self.assertEqual(tc.install_dir("ffmpeg", "x86_64"),
+                         Path("out") / "ffmpeg" / "linux" / "x86_64")
+
+    def test_expand_abis(self):
+        _, tc = self._context()
+        self.assertEqual(tc.expand_abis(None), tc.default_abis)   # 默认取宿主架构
+        self.assertEqual(tc.expand_abis(["all"]), ["x86_64", "arm64", "armhf"])
+
+    def test_ffmpeg_native_args(self):
+        # 本机 Linux 不做交叉编译：不能出现 --enable-cross-compile / --sysroot / xcrun
+        from ffmpeg_build import recipes
+        ctx, tc = self._context()
+        tc.nasm = "/usr/bin/nasm"
+        args = recipes._ffmpeg_platform_args(ctx, "x86_64")
+        joined = " ".join(args)
+        self.assertIn("--target-os=linux", args)
+        self.assertIn("--arch=x86_64", args)
+        self.assertIn("--enable-static", args)
+        self.assertNotIn("--enable-cross-compile", args)
+        self.assertNotIn("xcrun", joined)
+        # 没有 nasm 时降级关闭 x86 汇编，而不是编译到一半才失败
+        tc.nasm = ""
+        self.assertIn("--disable-x86asm", recipes._ffmpeg_platform_args(ctx, "x86_64"))
+
+
+class PlatformOverrideTest(unittest.TestCase):
+    """platform_overrides：同一份锁定文件按平台换源码来源。"""
+
+    def test_override_only_for_matching_platform(self):
+        from ffmpeg_build.config import dep_source
+        ffmpeg = dep_source("ffmpeg")
+        self.assertTrue(ffmpeg.url.startswith("https://git.woa.com"))     # 默认仍是内网
+        linux = dep_source("ffmpeg", "linux")
+        self.assertNotEqual(linux.url, ffmpeg.url)
+        self.assertTrue(linux.commit)                                     # 覆盖项也要锁 commit
+        self.assertEqual(dep_source("ffmpeg", "windows").url, ffmpeg.url)  # 未命中沿用原条目
+
+    def test_override_is_not_ffmpeg_only(self):
+        # fdk-aac 在 Linux 上换上游镜像（commit 与内网版相同），证明这是通用能力
+        from ffmpeg_build.config import dep_source
+        default = dep_source("fdk-aac")
+        linux = dep_source("fdk-aac", "linux")
+        self.assertTrue(default.url.startswith("https://git.woa.com"))
+        self.assertIn("github.com", linux.url)
+        self.assertEqual(linux.commit, default.commit)   # 同一份源码，只换下载地址
 
 
 class OHOSTest(unittest.TestCase):

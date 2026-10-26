@@ -747,10 +747,82 @@ class OHOSToolchain(Toolchain):
         return [self._find_bash() or "/bin/bash", "-lc", script], cwd
 
 
+# ------------------------------------------------------------------ Linux
+# 本机 Linux 构建（gcc/clang + GNU make）：用于服务端开播/推流，也用来在本机
+# 快速验证裁剪白名单是否真的编进产物（产物能直接跑，自检不必等到 Windows）。
+LINUX_ABI = {
+    "x86_64": {"arch": "x86_64", "openssl": "linux-x86_64", "openh264": "x86_64"},
+    "arm64": {"arch": "aarch64", "openssl": "linux-aarch64", "openh264": "arm64"},
+    "armhf": {"arch": "arm", "openssl": "linux-armv4", "openh264": "arm"},
+}
+# uname -m -> 本工程使用的 ABI 名（默认 ABI 取构建主机实际架构，不写死 x86_64）
+LINUX_HOST_ARCH = {"x86_64": "x86_64", "amd64": "x86_64",
+                   "aarch64": "arm64", "arm64": "arm64",
+                   "armv7l": "armhf", "armv8l": "armhf"}
+
+
+class LinuxToolchain(Toolchain):
+    name = "linux"
+    default_abis = [LINUX_HOST_ARCH.get(platform_mod.machine(), "x86_64")]
+    use_abi_dir = True
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.cc = which("gcc") or which("clang") or which("cc") or ""
+        self.cxx = which("g++") or which("clang++") or which("c++") or ""
+        self.compiler_id = "clang" if "clang" in Path(self.cc).name else "gcc"
+        # x86 汇编（ffmpeg 的 x86asm / openh264 的 asm）需要 nasm；缺了不是致命错误，
+        # 由配方降级为 --disable-x86asm / USE_ASM=No，而不是编译到一半才炸
+        self.nasm = which("nasm") or which("yasm") or ""
+
+    def prepare(self) -> None:
+        if platform_mod.system() != "Linux":
+            raise ToolchainError("Linux", f"Linux 产物需在 Linux 上构建（当前宿主 {platform_mod.system()}）",
+                                 "换一台 Linux 机器，或改用 --platform windows/android/ios/ohos")
+        if not self.cc:
+            raise ToolchainError("gcc/clang", "未找到 C 编译器", "dnf install -y gcc / apt install -y build-essential")
+        for tool, hint in (("make", "openssl/openh264/ffmpeg 需要 GNU make"),
+                           ("cmake", "srt/fdk-aac/zlib/libyuv 用 CMake 构建"),
+                           ("pkg-config", "ffmpeg 的 configure 靠它找 openssl/srt/fdk-aac/openh264"),
+                           ("perl", "openssl 的 Configure 需要 perl")):
+            if not which(tool):
+                raise ToolchainError(tool, f"未找到 {tool}（{hint}）", f"dnf install -y {tool} / apt install -y {tool}")
+        unknown = [a for a in self.ctx.abis if a not in LINUX_ABI]
+        if unknown:
+            raise ToolchainError("Linux ABI", f"不支持: {unknown}", f"可选: {', '.join(LINUX_ABI)}")
+        if not self.nasm:
+            self.logger.warn("未找到 nasm/yasm：ffmpeg 与 openh264 将降级为不使用 x86 汇编（编码性能略降）")
+        self.logger.info(f"Linux 工具链: CC={self.cc} CXX={self.cxx} nasm={self.nasm or '-'}")
+
+    @property
+    def marker_variant(self) -> str:
+        """Linux 没有类似 CRT/API 级别/最低版本的硬约束，版本文件名里不追加关键信息。"""
+        return ""
+
+    def build_env(self, abi: str) -> Dict[str, str]:
+        env = os.environ.copy()
+        env.update({"CC": self.cc, "CXX": self.cxx,
+                    "CFLAGS": "-fPIC -O3", "CXXFLAGS": "-fPIC -O3"})
+        return env
+
+    def cmake_args(self, abi: str) -> List[str]:
+        return ["-G", "Unix Makefiles", "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
+
+    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
+        if not requested:
+            return list(self.default_abis)
+        expanded: List[str] = []
+        for item in requested:
+            expanded += list(LINUX_ABI) if item in ("all", "*") else [item]
+        return expanded or list(self.default_abis)
+
+
 TOOLCHAINS = {"windows": WindowsToolchain, "android": AndroidToolchain,
-              "ios": IOSToolchain, "ohos": OHOSToolchain}
+              "ios": IOSToolchain, "ohos": OHOSToolchain, "linux": LinuxToolchain}
 PLATFORM_ALIASES = {"win": "windows", "win64": "windows", "mac": "ios", "iphoneos": "ios", "darwin": "ios",
-                    "openharmony": "ohos", "harmonyos": "ohos", "harmony": "ohos", "oh": "ohos"}
+                    "openharmony": "ohos", "harmonyos": "ohos", "harmony": "ohos", "oh": "ohos",
+                    "linux64": "linux", "gnu-linux": "linux"}
 
 
 def normalize_platform(name: str) -> str:
@@ -768,4 +840,6 @@ def create_toolchain(name: str, ctx, **kwargs) -> Toolchain:
         return cls(ctx, ndk=kwargs.get("ndk"), api=kwargs.get("api", 21))
     if cls is OHOSToolchain:
         return cls(ctx, sdk=kwargs.get("ohos_sdk"))
+    if cls is LinuxToolchain:      # 本机编译，没有 SDK / 最低版本之类的平台参数
+        return cls(ctx)
     return cls(ctx, min_version=kwargs.get("min_version", "12.0"))

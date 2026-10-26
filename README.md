@@ -14,10 +14,11 @@
 - [2. 产物输出目录（必填）](#2-产物输出目录必填)
 - [3. 使用攻略](#3-使用攻略)
   - [3.1 Windows](#31-首次使用windows)
-  - [3.2 iOS / Android](#32-macos-上编译-ios--android)
-  - [3.3 OHOS](#33-ohosopenharmony)
-  - [3.4 分步 / 增量](#34-分步--增量)
-  - [3.5 常用参数](#35-常用参数)
+  - [3.2 Linux（本机 gcc）](#32-linux本机-gcc)
+  - [3.3 iOS / Android](#33-macos-上编译-ios--android)
+  - [3.4 OHOS](#34-ohosopenharmony)
+  - [3.5 分步 / 增量](#35-分步--增量)
+  - [3.6 常用参数](#36-常用参数)
 - [4. 目录结构](#4-目录结构脚本入库源码产物不入库)
 - [5. ffmpeg 裁剪策略](#5-ffmpeg-裁剪策略)
 - [6. 环境要求与排错](#6-环境要求与排错)
@@ -277,6 +278,7 @@ Android / iOS / OHOS 同样以 `PLATFORM_LAYOUT` 对齐 `3rd-bak`：
 
 | 平台 | 布局 | 说明 |
 | - | - | - |
+| linux | `abi`：`<库>/linux/<abi>/{include,lib,bin}` | 无 3rd-bak 历史包袱，统一带 abi 层 |
 | android | `abi`（默认）：`<库>/android/<abi>/{include,lib,bin}`；`spdlog` → `flat` | 对齐 `ffmpeg-capturer/android/arm64-v8a/{bin,include,lib,share}`、`spdlog/android/{include,lib}` |
 | ohos | 同上（`libyuv/ohos/<abi>`、`spdlog/ohos/{include,lib}`） | 对齐 3rd-bak |
 | ios | `flat` + lipo 合并：**`<库>/ios/{include,lib}`（fat，无 abi 层）** | 对齐 `ffmpeg-capturer/ios/{include,lib}`、`libyuv/ios/{include,lib}` |
@@ -378,7 +380,39 @@ dir D:\work\TGCapture3rd
 
 一键脚本：`powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1`
 
-### 3.2 macOS 上编译 iOS / Android
+### 3.2 Linux（本机 gcc）
+
+服务端开播 / 本机验证：**本机编译，不需要任何交叉工具链**（gcc + make + cmake +
+pkg-config + perl；nasm 可选）。
+
+```bash
+# ① 自检（缺什么就直接给出 dnf/apt 安装命令；nasm 缺失只是降级，不阻断）
+python3 build.py bootstrap --platform linux
+
+# ② 编译开播全套 -> <输出目录>/<库>/linux/x86_64
+python3 build.py build --platform linux -o ~/TGCapture3rd-linux
+
+# 只编 ffmpeg（依赖已就绪时）
+python3 build.py build --platform linux -o ~/TGCapture3rd-linux --libs ffmpeg
+```
+
+要点：
+
+* **ABI 默认取宿主架构**（`x86_64` / `arm64` / `armhf`），不必显式给 `--abi`；`--abi all` 三个架构全编。
+* 产物是**静态库**（`--enable-static --disable-shared`，与 Android/iOS 一致）。
+  `ffmpeg/linux/x86_64/bin/ffmpeg` 可直接执行，构建结束会**自动跑一次组件自检**
+  （白名单里的编码器 / 协议 / 滤镜是否真编进去了，缺了会 WARN）——
+  这是本机平台独有的好处，Windows 之外终于也能自检了。
+* **x86 汇编需要 nasm**；没有时自动 `--disable-x86asm`（openh264 用 `USE_ASM=No`），
+  不会编译到一半才失败。
+* **内网仓库不可达时的兜底**：`ffmpeg` 与 `fdk-aac` 在锁定文件里带 `platform_overrides.linux`，
+  改用上游 GitHub 的同版本（ffmpeg → `n6.1.6`；fdk-aac → `v2.0.3`，其 commit 与内网版完全相同）。
+  这是**通用的按平台换源**能力（任何库都能写 `platform_overrides`），其它平台仍走内网。
+* **RHEL 系发行版**（TencentOS / CentOS / Rocky）上 CMake 与 openssl 默认装到 `lib64`，
+  而 ffmpeg 的 configure 固定按 `<prefix>/lib` 找依赖 —— 脚本会在安装后把 `lib64`
+  收敛到 `lib`，产物布局与其它平台一致（见 `recipes.py::collapse_lib_dirs`）。
+
+### 3.3 macOS 上编译 iOS / Android
 
 ```bash
 python3 build.py bootstrap --platform ios --install
@@ -391,7 +425,7 @@ python3 build.py build --platform android --abi arm64-v8a --api 21 -o D:/work/TG
 脚本（输出目录同样必填：第二个参数，或环境变量 `FFMPEG_3RD_OUTPUT`，不给时默认 `../TGCapture3rd`）：
 `./scripts/build_ios.sh fat /path/to/TGCapture3rd`、`./scripts/build_android.sh`
 
-### 3.3 OHOS（OpenHarmony）
+### 3.4 OHOS（OpenHarmony）
 
 原 `MediaX/ESMediaX/3rd/build_*.py` 的能力已并入这里，统一用一套脚本产出：
 
@@ -418,7 +452,7 @@ python build.py build --platform ohos --libs openh264 -o D:/work/TGCapture3rd
   若改用官方 ffmpeg 源码，把 `config.py` 的 `OHOS_FFMPEG_EXTRA_ARGS` 置空即可。
 * 宿主建议 Linux/macOS；Windows 需自备 MSYS2/Git Bash（提供 bash + GNU make + perl）。
 
-### 3.4 分步 / 增量
+### 3.5 分步 / 增量
 
 ```bash
 set OUT=D:/work/TGCapture3rd
@@ -434,12 +468,12 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 > ffmpeg 构建前会校验 `openssl / fdk-aac / openh264 / srt` 是否已产出，
 > 未就绪会直接提示"请先编译依赖"，而不是报含糊的 `xxx not found`。
 
-### 3.5 常用参数
+### 3.6 常用参数
 
 | 参数 | 说明 | 默认 |
 | - | - | - |
-| `-p/--platform` | `windows` / `android` / `ios` | 必填 |
-| `--abi` | windows `x64`；android `arm64-v8a`/`armeabi-v7a`/`x86_64`；ios `arm64`/`x86_64`/`fat` | 平台默认 |
+| `-p/--platform` | `windows` / `linux` / `android` / `ios` / `ohos` | 必填 |
+| `--abi` | windows `x64`/`x86`/`arm64`；linux `x86_64`/`arm64`/`armhf`（默认宿主架构）；android `arm64-v8a`/`armeabi-v7a`/`x86_64`；ios `arm64`/`x86_64`/`fat`；ohos `arm64-v8a`/`armeabi-v7a`/`x86_64` | 平台默认 |
 | `--libs` | 逗号分隔，`all` 为必须库全集 | `all` |
 | `-o/--output` | 产物输出目录 | **必填**（或环境变量 `FFMPEG_3RD_OUTPUT`） |
 | `-j/--jobs` | 并行任务数 | CPU-1 |
@@ -504,6 +538,7 @@ FfmpegCompileShell/
 
 | 平台 | 编译主机 | 工具链 |
 | - | - | - |
+| linux | Linux | gcc/clang + GNU make + cmake + pkg-config + perl（nasm 可选，缺则关 x86 汇编） |
 | windows | Windows | VS 2022 Build Tools（MSVC）+ MSYS2（make/install/perl/nasm）+ cmake/ninja |
 | android | macOS / Linux | Android NDK r21+（可 `bootstrap --install` 自动下载 r27c）+ cmake + make |
 | ios | macOS | Xcode 命令行工具 + cmake + nasm（模拟器架构需要）+ pkg-config（ffmpeg configure 找 openssl/srt/fdk-aac/openh264 用） |

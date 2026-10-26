@@ -35,6 +35,16 @@
                   "ref": "ohos-n6.1.2_dev",
                   "commit": "",
                   "note": "OHOS 需 openharmony-tpc 的 fork（--enable-ohosavcodecdecoder 仅该分支有）"
+                },
+                "linux": {
+                  "kind": "git",
+                  "version": "6.1.6",
+                  "url": "https://github.com/FFmpeg/FFmpeg.git",
+                  "tag": "n6.1.6",
+                  "ref": "n6.1.6",
+                  "commit": "f1e3a2bf7a2f2cde936d1ed97f09a26853d20125",
+                  "internal": false,
+                  "note": "内网 git.woa.com 需要工蜂鉴权，在 Linux 构建机上匿名拉取会失败；故该平台改用上游官方仓库的同版本 n6.1.6（版本与内网版一致，commit 单独锁定保证可复现）；9266ee0 是 n6.1.6 的附注标签对象，真正的发布 commit 是 f1e3a2b，故锁定后者"
                 }
               }
             }
@@ -42,7 +52,6 @@
         }
       }
     },
-
     "ffmpeg_deps": {
       "description": "FFmpeg 的构建期依赖：configure 需对应 --enable-*，产物静态并入 avcodec/avformat。Windows 上应用无需再链；Android 为独立 .so，需随包并显式链接",
       "build_input_of": "ffmpeg",
@@ -91,6 +100,18 @@
           "commit": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
           "internal": true,
           "ffmpeg_flag": "--enable-libfdk-aac",
+          "platform_overrides": {
+            "linux": {
+              "kind": "git",
+              "version": "2.0.3",
+              "url": "https://github.com/mstorsjo/fdk-aac.git",
+              "tag": "v2.0.3",
+              "ref": "v2.0.3",
+              "commit": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
+              "internal": false,
+              "note": "上游 v2.0.3 的 commit 与内网 fdk_aac_v2.0.3 逐字节相同（同为 716f4394），只是换下载地址；Linux 上内网不可达时使用"
+            }
+          },
           "note": "用内网 fdk_aac_v2.0.3（与 FFmpeg 6.1 的 libfdk-aac wrapper 匹配；上游 v3.0.0 为大版本跨越，暂不升级）"
         },
         "openh264": {
@@ -106,7 +127,6 @@
         }
       }
     },
-
     "standalone": {
       "description": "与 FFmpeg 无关的独立库：不参与 FFmpeg 构建，由应用直接链接（或 header-only 直接包含）",
       "build_input_of": null,
@@ -124,7 +144,9 @@
         "json": {
           "kind": "archive",
           "layout": "portable",
-          "output_subdirs": ["single_include"],
+          "output_subdirs": [
+            "single_include"
+          ],
           "version": "3.12.0",
           "homepage": "https://github.com/nlohmann/json",
           "url": "https://github.com/nlohmann/json/releases/download/v3.12.0/include.zip",
@@ -145,7 +167,6 @@
         }
       }
     },
-
     "ffmpeg_hw_sdks": {
       "description": "桌面硬编 SDK：ffmpeg 的构建期输入（不是要编译的库）。只有 --enable-nvenc / --enable-amf 时才拉取；platforms 决定平台适用范围（目前只有 windows，iOS/Android 走 videotoolbox / mediacodec，不用这些 SDK）。头文件不安装到产物目录——运行期靠显卡驱动，不需要头文件",
       "build_input_of": "ffmpeg",
@@ -153,7 +174,9 @@
         "amf": {
           "kind": "git",
           "version": "1.4.34",
-          "platforms": ["windows"],
+          "platforms": [
+            "windows"
+          ],
           "homepage": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF",
           "url": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
           "tag": "v1.4.34",
@@ -162,18 +185,24 @@
           "internal": false,
           "depth": 1,
           "partial": true,
-          "sparse": ["amf/public/include"],
+          "sparse": [
+            "amf/public/include"
+          ],
           "include_dir": "amf/public/include",
           "header_prefix": "AMF",
           "marker": "AMF/core/Version.h",
           "ffmpeg_flag": "--enable-amf",
-          "extra_flags": ["--enable-d3d11va"],
+          "extra_flags": [
+            "--enable-d3d11va"
+          ],
           "note": "AMD AMF：h264_amf / hevc_amf / av1_amf 编码器。直接用上游 GitHub 并锁 tag v1.4.34（ffmpeg 6.1 要求 AMF >= 1.4.29，该 tag 的 Version.h = 1.4.34.0）。仓库里头文件在 amf/public/include/{core,components}，没有 AMF/ 这一层；ffmpeg 写的是 #include <AMF/core/Version.h>，故构建时规整出 <out>/amf/windows/include/AMF/...。仓库自带 Thirdparty/（DeckLink SDK、预编译 ffmpeg-6.0 等约 490MB）只服务于 AMF 自己的 samples，构建用不到，因此 sparse 只检出 amf/public/include：--depth 1 + --filter=blob:none + sparse-checkout，其余内容连字节都不下载"
         },
         "nv-codec-headers": {
           "kind": "git",
           "version": "12.0.16.1",
-          "platforms": ["windows"],
+          "platforms": [
+            "windows"
+          ],
           "homepage": "https://github.com/FFmpeg/nv-codec-headers",
           "url": "https://github.com/FFmpeg/nv-codec-headers.git",
           "tag": "n12.0.16.1",
@@ -185,7 +214,9 @@
           "marker": "ffnvcodec/nvEncodeAPI.h",
           "pkgconfig_template": "ffnvcodec.pc.in",
           "ffmpeg_flag": "--enable-nvenc",
-          "extra_flags": ["--enable-ffnvcodec"],
+          "extra_flags": [
+            "--enable-ffnvcodec"
+          ],
           "note": "NVIDIA nv-codec-headers：h264_nvenc / hevc_nvenc 编码器。直接用上游 GitHub，锁 tag n12.0.16.1（上游 tag 名带 n 前缀，commit 取剥壳后的 451da996；其 ffnvcodec.pc.in 与内网镜像逐字节一致）。该版本对应 Video Codec SDK 12.0.16，与 ffmpeg 6.1.6 匹配；升到 13.x 会抬高运行期驱动要求。仓库只有 include/ffnvcodec/*.h，无需 sparse。ffmpeg 用 check_pkg_config 找 ffnvcodec（要带版本号的 .pc），故构建时按 .pc.in 生成 ffnvcodec.pc（版本 12.0.16.1）；extra_flags 里的 --enable-ffnvcodec 不能省——--disable-everything 会连外部库 ffnvcodec 一起关掉，nvenc 的依赖就满足不了"
         }
       }

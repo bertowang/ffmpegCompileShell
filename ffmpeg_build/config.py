@@ -50,15 +50,18 @@ ANDROID_LAYOUT: Dict[str, str] = {"spdlog": "flat"}
 OHOS_LAYOUT: Dict[str, str] = {"spdlog": "flat"}
 # iOS 走 lipo 合并的 fat 库，天然没有 abi 层
 IOS_LAYOUT: Dict[str, str] = {}
+# Linux：没有 3rd-bak 的历史包袱，统一 <库>/linux/<abi>/{include,lib,bin}
+LINUX_LAYOUT: Dict[str, str] = {}
 
 PLATFORM_LAYOUT: Dict[str, Dict[str, str]] = {
     "windows": WINDOWS_LAYOUT,
     "android": ANDROID_LAYOUT,
     "ohos": OHOS_LAYOUT,
     "ios": IOS_LAYOUT,
+    "linux": LINUX_LAYOUT,
 }
 DEFAULT_PLATFORM_LAYOUT: Dict[str, str] = {
-    "windows": "abi", "android": "abi", "ohos": "abi", "ios": "flat",
+    "windows": "abi", "android": "abi", "ohos": "abi", "ios": "flat", "linux": "abi",
 }
 DEFAULT_WINDOWS_LAYOUT = DEFAULT_PLATFORM_LAYOUT["windows"]
 
@@ -168,8 +171,20 @@ def _source_for(spec: dict):
                          sha256=spec.get("sha256") or None)
 
 
-def dep_source(name: str):
-    return _source_for(dep(name))
+def dep_source(name: str, platform: str = ""):
+    """取某库的源码描述；``platform`` 命中锁定文件的 ``platform_overrides`` 时用覆盖条目。
+
+    "同一份锁定文件、按平台换来源"是通用需求，不该只给 ffmpeg 开小灶：
+
+      * OHOS 要用 openharmony-tpc 的 fork（``--enable-ohosavcodecdecoder`` 只有它有）；
+      * Linux 上内网 ``git.woa.com`` 不可达时，改用上游官方仓库的同版本镜像。
+
+    因此做成通用能力：任何库都能在自己的条目里写 ``platform_overrides``，
+    未命中的平台仍用条目本身的 address/version/commit。
+    """
+    spec = dep(name)
+    override = (spec.get("platform_overrides") or {}).get(platform) if platform else None
+    return _source_for(override or spec)
 
 
 # ------------------------------------------------- 桌面硬编 SDK（仅构建期输入）
@@ -195,12 +210,9 @@ def hw_sdk(name: str, platform: str = "") -> Optional[dict]:
     return spec
 
 
-# OHOS 官方 ffmpeg 没有 OpenHarmony 媒体框架适配，故该平台改用 openharmony-tpc 的 fork
-# （--enable-ohosavcodecdecoder 只有这个 fork 才有），配置见锁定文件的 platform_overrides
-FFMPEG_PLATFORM_SOURCE: Dict[str, object] = {
-    platform: _source_for(spec)
-    for platform, spec in ((DEPS_LIBRARIES.get("ffmpeg") or {}).get("platform_overrides") or {}).items()
-}
+# 按平台换源码（OHOS 用 openharmony-tpc 的 fork、Linux 用上游镜像）统一走
+# 锁定文件各条目自己的 platform_overrides，由 dep_source(name, platform) 解析，
+# 不再单独维护一张"只属于 ffmpeg"的覆盖表。
 # OHOS 平台追加的 ffmpeg 开关；改用官方 ffmpeg 源码时把这里置空
 OHOS_FFMPEG_EXTRA_ARGS: List[str] = ["--enable-ohosavcodecdecoder"]
 

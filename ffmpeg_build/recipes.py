@@ -25,12 +25,19 @@ def _set_current(lib: str) -> None:
 
 
 # ----------------------------------------------------------------- CMake 辅助
+def cmake_bin(ctx) -> str:
+    """configure / build / install 三个阶段必须用同一个 cmake。
+
+    OHOS 只能用 SDK 自带的 cmake（系统 cmake 与 ohos.toolchain.cmake 规则不兼容），
+    若 build/install 仍从 PATH 取 cmake，就会出现"用 A 配置、用 B 编译"的错配。
+    """
+    return getattr(ctx.toolchain, "cmake_bin", "") or "cmake"
+
+
 def cmake_configure(ctx, src: Path, build_dir: Path, abi: str, extra: Optional[List[str]] = None) -> None:
     build_dir = Path(build_dir)
     ensure_dir(build_dir)
-    # OHOS 必须用 SDK 自带 cmake（系统 cmake 版本/规则不兼容 ohos.toolchain.cmake）
-    cmake = getattr(ctx.toolchain, "cmake_bin", "") or "cmake"
-    cmd = [cmake, "-S", str(src), "-B", str(build_dir)]
+    cmd = [cmake_bin(ctx), "-S", str(src), "-B", str(build_dir)]
     cmd += ctx.toolchain.cmake_args(abi)
     cmd += [f"-DCMAKE_INSTALL_PREFIX={ctx.stage_dir(CURRENT_LIB['name'], abi)}",
             "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]   # CMake 4 需要，兼容老项目(如 srt)
@@ -39,7 +46,7 @@ def cmake_configure(ctx, src: Path, build_dir: Path, abi: str, extra: Optional[L
 
 
 def cmake_build(ctx, build_dir: Path, abi: str, target: Optional[str] = None, lib: str = "") -> None:
-    cmd = ["cmake", "--build", str(build_dir)]
+    cmd = [cmake_bin(ctx), "--build", str(build_dir)]
     if getattr(ctx.toolchain, "needs_config_type", False):
         cmd += ["--config", "Release"]
     if target:
@@ -48,11 +55,38 @@ def cmake_build(ctx, build_dir: Path, abi: str, target: Optional[str] = None, li
     ctx.runner.run(cmd, cwd=build_dir, env=ctx.toolchain.build_env(abi), log_name=f"{lib}-{abi}-build")
 
 
+def collapse_lib_dirs(stage: Path) -> None:
+    """把 ``lib64`` / multiarch 子目录收敛进 ``lib``。
+
+    RHEL 系发行版上 CMake 的 ``GNUInstallDirs`` 与 openssl 的 ``Configure`` 默认装到
+    ``lib64``（Debian 系还有 ``lib/<multiarch>``），而 ffmpeg 的 configure 固定按
+    ``<prefix>/lib`` 找依赖 —— 产物里若只有 ``lib64``，ffmpeg 会因为找不到库而失败。
+    统一收敛到 ``lib``，各平台的产物布局才一致。
+    """
+    stage = Path(stage)
+    lib_dir = stage / "lib"
+    extra: List[Path] = []
+    if (stage / "lib64").is_dir():
+        extra.append(stage / "lib64")
+    if lib_dir.is_dir():
+        extra += [p for p in lib_dir.iterdir() if p.is_dir() and p.name.endswith("-linux-gnu")]
+    for source in extra:
+        ensure_dir(lib_dir)
+        for entry in list(source.iterdir()):
+            target = lib_dir / entry.name
+            if target.exists():          # lib 下已有同名（如 pkgconfig）就保留 lib 的
+                continue
+            shutil.move(str(entry), str(target))
+        shutil.rmtree(source, ignore_errors=True)
+
+
 def cmake_install(ctx, build_dir: Path, abi: str, lib: str = "") -> None:
-    cmd = ["cmake", "--install", str(build_dir)]
+    cmd = [cmake_bin(ctx), "--install", str(build_dir)]
     if getattr(ctx.toolchain, "needs_config_type", False):
         cmd += ["--config", "Release"]
     ctx.runner.run(cmd, cwd=build_dir, env=ctx.toolchain.build_env(abi), log_name=f"{lib}-{abi}-install")
+    if lib:                             # RHEL 系会装到 lib64，收敛成统一的 lib
+        collapse_lib_dirs(ctx.stage_dir(lib, abi))
 
 
 # ------------------------------------------------------------------ openssl
@@ -72,7 +106,7 @@ IOS_OPENSSL_TARGETS = {
 def build_openssl(ctx, abi: str) -> Path:
     _set_current("openssl")
     stage = ensure_dir(ctx.stage_dir("openssl", abi))
-    src = ctx.sources.ensure(C.LIBRARIES["openssl"].source, ctx.source_dir("openssl"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("openssl", ctx.platform), ctx.source_dir("openssl"), ctx.force_fetch)
     toolchain, platform = ctx.toolchain, ctx.platform
 
     if platform == "windows":
@@ -101,10 +135,17 @@ def build_openssl(ctx, abi: str) -> Path:
             target = OHOS_ABI[abi]["openssl"]
             configure = (f"./Configure {target} -fPIC {' '.join(OPENSSL_OPTIONS)} "
                          f"--prefix={stage} --openssldir={stage}/ssl")
+        elif platform == "linux":
+            # 本机 Linux：直接用 openssl 自带的 linux-* target（与 OHOS 同族，只是 glibc）
+            from .toolchains import LINUX_ABI
+            target = LINUX_ABI[abi]["openssl"]
+            configure = (f"./Configure {target} -fPIC {' '.join(OPENSSL_OPTIONS)} "
+                         f"--prefix={stage} --openssldir={stage}/ssl")
         else:
             configure = (f"./Configure {IOS_OPENSSL_TARGETS.get(abi, 'ios64-xcrun')} "
                          f"{' '.join(OPENSSL_OPTIONS)} --prefix={stage} --openssldir={stage}/ssl")
         toolchain.sh(f"{configure} && make -j{ctx.jobs} && make install_sw", cwd=src, abi=abi, log_name=f"openssl-{abi}")
+        collapse_lib_dirs(stage)        # RHEL 系 openssl 默认装到 lib64
 
     # Windows：产物名与 ffmpeg 预期不一致，补别名与 .pc
     if platform == "windows":
@@ -135,7 +176,7 @@ def _native_perl(toolchain) -> Optional[str]:
 def build_srt(ctx, abi: str) -> Path:
     _set_current("srt")
     stage = ctx.stage_dir("srt", abi)
-    src = ctx.sources.ensure(C.LIBRARIES["srt"].source, ctx.source_dir("srt"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("srt", ctx.platform), ctx.source_dir("srt"), ctx.force_fetch)
     build_dir = ctx.work_dir("srt", abi) / "cmake-build"
     cmake_configure(ctx, src, build_dir, abi, extra=[
         "-DENABLE_SHARED=OFF", "-DENABLE_STATIC=ON", "-DENABLE_APPS=OFF",
@@ -151,17 +192,18 @@ def build_srt(ctx, abi: str) -> Path:
         for name in ("srt_static.lib", "libsrt.lib"):
             if (lib_dir / name).exists() and not (lib_dir / "srt.lib").exists():
                 shutil.copy2(lib_dir / name, lib_dir / "srt.lib")
-        # ffmpeg 找包名 srt，而 srt 安装的是 haisrt.pc
-        pc_dir = lib_dir / "pkgconfig"
-        if (pc_dir / "haisrt.pc").exists() and not (pc_dir / "srt.pc").exists():
-            shutil.copy2(pc_dir / "haisrt.pc", pc_dir / "srt.pc")
+    # ffmpeg 按包名 srt 找，而 srt 装的是 haisrt.pc（各平台皆然，不只是 Windows）；
+    # 缺这份别名时 configure 会报 "srt not found using pkg-config"
+    pc_dir = stage / "lib" / "pkgconfig"
+    if (pc_dir / "haisrt.pc").exists() and not (pc_dir / "srt.pc").exists():
+        shutil.copy2(pc_dir / "haisrt.pc", pc_dir / "srt.pc")
     return stage
 
 
 # ------------------------------------------------------------------ fdk-aac
 def build_fdk_aac(ctx, abi: str) -> Path:
     _set_current("fdk-aac")
-    src = ctx.sources.ensure(C.LIBRARIES["fdk-aac"].source, ctx.source_dir("fdk-aac"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("fdk-aac", ctx.platform), ctx.source_dir("fdk-aac"), ctx.force_fetch)
     build_dir = ctx.work_dir("fdk-aac", abi) / "cmake-build"
     cmake_configure(ctx, src, build_dir, abi, extra=[
         "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_PROGRAMS=OFF",
@@ -176,7 +218,7 @@ def build_fdk_aac(ctx, abi: str) -> Path:
 def build_openh264(ctx, abi: str) -> Path:
     _set_current("openh264")
     stage = ensure_dir(ctx.stage_dir("openh264", abi))
-    src = ctx.sources.ensure(C.LIBRARIES["openh264"].source, ctx.source_dir("openh264"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("openh264", ctx.platform), ctx.source_dir("openh264"), ctx.force_fetch)
     toolchain, platform = ctx.toolchain, ctx.platform
 
     if platform == "ios":
@@ -201,6 +243,12 @@ def build_openh264(ctx, abi: str) -> Path:
         from .toolchains import OHOS_ABI
         script = (f"make -j{ctx.jobs} OS=linux ARCH={OHOS_ABI[abi]['openh264']} "
                   f"install-static PREFIX={stage}")
+    elif platform == "linux":
+        from .toolchains import LINUX_ABI
+        # 汇编需要 nasm；没有就关掉（USE_ASM=No），别让编译到一半才失败
+        use_asm = "Yes" if getattr(toolchain, "nasm", "") else "No"
+        script = (f"make -j{ctx.jobs} OS=linux ARCH={LINUX_ABI[abi]['openh264']} "
+                  f"USE_ASM={use_asm} BUILDTYPE=Release install-static PREFIX={stage}")
     else:
         arch = abi.replace('-simulator', '')
         # openh264 是**源码内**编译：多 ABI 共用同一份源码时，上一架构留下的 .o 与 .a
@@ -248,7 +296,7 @@ LIBYUV_CANDIDATES = ("yuv.lib", "libyuv.a", "yuv.a")
 def build_libyuv(ctx, abi: str) -> Path:
     """libyuv 的 CMake 安装规则含工具目标，故只构建 yuv 并手动归集。"""
     _set_current("libyuv")
-    src = ctx.sources.ensure(C.LIBRARIES["libyuv"].source, ctx.source_dir("libyuv"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("libyuv", ctx.platform), ctx.source_dir("libyuv"), ctx.force_fetch)
     build_dir = ctx.work_dir("libyuv", abi) / "cmake-build"
     cmake_configure(ctx, src, build_dir, abi, extra=[
         "-DBUILD_SHARED_LIBS=OFF", "-DUNIT_TEST=OFF", "-DLIBYUV_DISABLE_JPEG=ON",
@@ -284,7 +332,7 @@ def build_json(ctx, abi: str) -> Path:
     （旧实现把 include 复制成两份冒充 single_include，既不是真单头也重复占空间。）
     """
     _set_current("json")
-    src = ctx.sources.ensure(C.LIBRARIES["json"].source, ctx.source_dir("json"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("json", ctx.platform), ctx.source_dir("json"), ctx.force_fetch)
     stage = ensure_dir(ctx.stage_dir("json", abi))
     subdirs = C.DEPS_LIBRARIES["json"].get("output_subdirs") or ["include", "single_include"]
     for sub in subdirs:
@@ -300,7 +348,7 @@ def build_json(ctx, abi: str) -> Path:
 # 链接方需带 SPDLOG_COMPILED_LIB（spdlog::spdlog target 会自动传播该宏）。
 def build_spdlog(ctx, abi: str) -> Path:
     _set_current("spdlog")
-    src = ctx.sources.ensure(C.LIBRARIES["spdlog"].source, ctx.source_dir("spdlog"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("spdlog", ctx.platform), ctx.source_dir("spdlog"), ctx.force_fetch)
     build_dir = ctx.work_dir("spdlog", abi) / "cmake-build"
     cmake_configure(ctx, src, build_dir, abi, extra=[
         "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
@@ -323,7 +371,7 @@ def build_spdlog(ctx, abi: str) -> Path:
 # 只编静态库；并补 z.lib / libz.a 别名——zlib.pc 与 ffmpeg 的 check_lib 都按 -lz 找。
 def build_zlib(ctx, abi: str) -> Path:
     _set_current("zlib")
-    src = ctx.sources.ensure(C.LIBRARIES["zlib"].source, ctx.source_dir("zlib"), ctx.force_fetch)
+    src = ctx.sources.ensure(C.dep_source("zlib", ctx.platform), ctx.source_dir("zlib"), ctx.force_fetch)
     build_dir = ctx.work_dir("zlib", abi) / "cmake-build"
     cmake_configure(ctx, src, build_dir, abi, extra=[
         "-DZLIB_BUILD_SHARED=OFF",      # 只要静态库，避免多出一个 zlib1.dll
@@ -506,8 +554,9 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     stage = ensure_dir(ctx.stage_dir("ffmpeg", abi))
     lib = C.LIBRARIES["ffmpeg"]
 
-    # 个别平台使用专用源码（OHOS 用 openharmony-tpc 的 fork）
-    source = C.FFMPEG_PLATFORM_SOURCE.get(ctx.platform, lib.source)
+    # 个别平台使用专用源码（见锁定文件各条目的 platform_overrides）：
+    # OHOS 用 openharmony-tpc 的 fork；Linux 上内网不可达时用上游镜像
+    source = C.dep_source("ffmpeg", ctx.platform)
     # 允许 --ffmpeg-ref 覆盖仓库分支/标签
     if ctx.ffmpeg_ref and ctx.ffmpeg_ref != source.ref:
         from dataclasses import replace
@@ -557,13 +606,17 @@ def build_ffmpeg(ctx, abi: str) -> Path:
         for import_lib in bin_dir.glob("*.lib"):
             if not (lib_dir / import_lib.name).exists():
                 shutil.copy2(import_lib, lib_dir / import_lib.name)
+    # 本机平台的产物能直接跑，顺手体检一次；交叉编译产物跳过
+    if ctx.platform in NATIVE_VERIFY_PLATFORMS:
         _verify_components(ctx, stage)
     return stage
 
 
 # 运行期组件自检：白名单里写了、但二进制没登记（GPL 冲突/依赖缺失/组件表被旧文件覆盖）
 # 都会静默发生，只有跑起来才暴露（如开播滤镜链找不到 volume/amix）。
-# 只在能直接执行产物的平台上跑（Windows 本机），交叉编译产物无法在宿主运行。
+# 只在"产物能直接在宿主执行"的平台上跑（Windows / Linux 本机）；
+# 交叉编译产物（android/ios/ohos）在宿主上跑不起来，只能跳过。
+NATIVE_VERIFY_PLATFORMS = ("windows", "linux")
 _COMPONENT_CHECKS = (("filters", "-filters"), ("decoders", "-decoders"),
                      ("encoders", "-encoders"), ("demuxers", "-demuxers"),
                      ("muxers", "-muxers"), ("protocols", "-protocols"),
@@ -574,8 +627,14 @@ _COMPONENT_ALIASES = {"protocols": {"libsrt": "srt"},
 
 
 def _verify_components(ctx, stage: Path) -> None:
-    exe = stage / "bin" / "ffmpeg.exe"
-    if not exe.exists():
+    bin_dir = stage / "bin"
+    exe = None
+    for name in ("ffmpeg.exe", "ffmpeg"):       # Windows 带 .exe，Linux 不带
+        candidate = bin_dir / name
+        if candidate.is_file():
+            exe = candidate
+            break
+    if exe is None:
         return
     wl = C.whitelist(getattr(ctx, "profile", ""))
     wl = dict(wl, encoders=C.whitelist_encoders(ctx.platform, getattr(ctx, "profile", ""),
@@ -811,6 +870,19 @@ def _ffmpeg_platform_args(ctx, abi) -> List[str]:
         if spec.get("neon"):
             args.append("--enable-neon")
         args += list(C.OHOS_FFMPEG_EXTRA_ARGS)
+        return args
+
+    if ctx.platform == "linux":
+        from .toolchains import LINUX_ABI
+        # 本机编译：不需要 --enable-cross-compile / --sysroot，直接用宿主 gcc；
+        # 产物为静态库（与 Android/iOS 一致），方便消费方直接链进自己的可执行文件
+        args = [f"--arch={LINUX_ABI[abi]['arch']}", "--target-os=linux",
+                "--enable-static", "--disable-shared", "--disable-symver",
+                # openssl 与 srt 都是静态库，系统侧依赖（m/pthread/dl/stdc++）要显式补上
+                "--extra-libs='-lm -lpthread -ldl -lstdc++'"]
+        if not getattr(ctx.toolchain, "nasm", ""):
+            # ffmpeg 6.1 的 x86 汇编要求 nasm >= 2.13；没有就整体关掉而不是编到一半失败
+            args.append("--disable-x86asm")
         return args
 
     toolchain = ctx.toolchain
