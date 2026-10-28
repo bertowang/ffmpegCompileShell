@@ -89,6 +89,39 @@ def cmake_install(ctx, build_dir: Path, abi: str, lib: str = "") -> None:
         collapse_lib_dirs(ctx.stage_dir(lib, abi))
 
 
+# ----------------------------------------------------------- 源码内构建隔离
+def _in_source_copy(ctx, lib: str, abi: str, src: Path) -> Path:
+    """为「源码内构建」的库（openssl / openh264 等 Makefile 直接在源码树里产生 .o/.a）
+    准备一份按 profile+platform+abi 隔离的源码副本，构建只在副本里进行。
+
+    这类库的 Makefile 没有 out-of-tree 选项；若直接在共用的 ``ctx.source_dir(lib)``
+    里构建，切换平台/ABI 时上一轮残留的中间产物（不同容器格式 ELF/Mach-O/COFF，
+    或同容器不同架构）会被 make 当作"已是最新"直接复用，混进新产物的 .a 里，
+    导致链接器报 "archive member is neither ET_REL nor LLVM bitcode" 或大量
+    undefined symbol —— 事后扫描文件魔数删残留 / 过滤归档成员只是在补救症状。
+    根治办法是让每个 (profile, platform, abi) 天然拥有独立源码树：
+    ``ctx.work_dir(lib, abi)`` 本就按三者隔离（见 config.py），构建前把共享源码
+    复制进去即可，make 产生的所有中间文件只会落在这份专属副本里，不会反向
+    污染共享的 ``sources/<lib>``，也不可能被其它平台/ABI 复用。
+
+    复制是幂等的：共享源码的 ``.deps_pin``（内容）没变就复用已有副本里的旧目标
+    文件（增量编译），锁定文件升级或 ``--force-fetch`` 时才整树重拷。
+    """
+    dest = ctx.work_dir(lib, abi) / "src"
+    pin_file = src / ".deps_pin"
+    pin = pin_file.read_text(encoding="utf-8", errors="ignore") if pin_file.is_file() else ""
+    stamp = dest / ".src_pin"
+    if (not ctx.force_fetch and dest.is_dir() and stamp.is_file()
+            and stamp.read_text(encoding="utf-8", errors="ignore") == pin):
+        return dest
+    remove_tree(dest)
+    ensure_dir(dest.parent)
+    shutil.copytree(src, dest, symlinks=True)
+    if pin:
+        stamp.write_text(pin, encoding="utf-8")
+    return dest
+
+
 # ------------------------------------------------------------------ openssl
 # 只做 RTMPS/TLS：关闭 apps/文档/测试与用不到的协议特性
 OPENSSL_OPTIONS = [
@@ -106,7 +139,10 @@ IOS_OPENSSL_TARGETS = {
 def build_openssl(ctx, abi: str) -> Path:
     _set_current("openssl")
     stage = ensure_dir(ctx.stage_dir("openssl", abi))
-    src = ctx.sources.ensure(C.dep_source("openssl", ctx.platform), ctx.source_dir("openssl"), ctx.force_fetch)
+    shared_src = ctx.sources.ensure(C.dep_source("openssl", ctx.platform), ctx.source_dir("openssl"), ctx.force_fetch)
+    # openssl 是源码内构建（Configure + make 直接在源码树产生 .o/.a），按 abi 隔离一份
+    # 副本再构建，避免多平台/ABI 共用同一份源码树时互相踩到对方的 Makefile 与目标文件
+    src = _in_source_copy(ctx, "openssl", abi, shared_src)
     toolchain, platform = ctx.toolchain, ctx.platform
 
     if platform == "windows":
@@ -218,7 +254,11 @@ def build_fdk_aac(ctx, abi: str) -> Path:
 def build_openh264(ctx, abi: str) -> Path:
     _set_current("openh264")
     stage = ensure_dir(ctx.stage_dir("openh264", abi))
-    src = ctx.sources.ensure(C.dep_source("openh264", ctx.platform), ctx.source_dir("openh264"), ctx.force_fetch)
+    shared_src = ctx.sources.ensure(C.dep_source("openh264", ctx.platform), ctx.source_dir("openh264"), ctx.force_fetch)
+    # openh264 是源码内构建（make 直接在源码树产生 .o/.a），按 abi 隔离一份副本再构建：
+    # 避免多平台/ABI 共用同一份源码树时互相踩到对方残留的目标文件（例如先编 iOS 再编
+    # Android，Android 的 .a 会把源码树里残留的 iOS Mach-O .o 当作"已是最新"直接混进去）
+    src = _in_source_copy(ctx, "openh264", abi, shared_src)
     toolchain, platform = ctx.toolchain, ctx.platform
 
     if platform == "ios":
@@ -232,11 +272,14 @@ def build_openh264(ctx, abi: str) -> Path:
     elif platform == "android":
         from .toolchains import ANDROID_ABI
         spec = ANDROID_ABI[abi]
-        bin_dir = toolchain.toolchain_bin
+        # build/platform-android.mk 在 NDK_TOOLCHAIN_VERSION=clang 分支里，自己按
+        # ARCH/NDKROOT/NDKLEVEL 推导 TARGET_NAME/CC/CXX/AR/SYSROOT，不需要（也不能）
+        # 手动传 TOOLCHAIN_NAME/GCC_TOOLCHAIN_PATH/SYSROOT/TARGET_NAME 覆盖——
+        # 命令行传入的 TARGET_NAME 优先级高于 Makefile 内的赋值，而 Makefile 自身是
+        # ``CC = $(TARGET_NAME)$(NDKLEVEL)-clang``，带 API 号的 TARGET_NAME 会让
+        # NDKLEVEL 被拼接两次，CC 路径变成不存在的 aarch64-linux-android2929-clang。
         script = (f"make -j{ctx.jobs} OS=android NDKROOT={toolchain.ndk} NDKLEVEL={toolchain.api} "
                   f"TARGET=android-{toolchain.api} ARCH={spec['openh264']} NDK_TOOLCHAIN_VERSION=clang "
-                  f"GCC_TOOLCHAIN_PATH={bin_dir} SYSROOT={bin_dir / 'sysroot'} "
-                  f"TOOLCHAIN_NAME={spec['triple']} TARGET_NAME={spec['triple']}{toolchain.api} "
                   f"install-static PREFIX={stage}")
     elif platform == "ohos":
         # OHOS 基于 linux 内核，openh264 走 OS=linux（编译器由 build_env 的 CC/CXX 指定）
@@ -251,11 +294,8 @@ def build_openh264(ctx, abi: str) -> Path:
                   f"USE_ASM={use_asm} BUILDTYPE=Release install-static PREFIX={stage}")
     else:
         arch = abi.replace('-simulator', '')
-        # openh264 是**源码内**编译：多 ABI 共用同一份源码时，上一架构留下的 .o 与 .a
-        # 会被 make 视为最新而直接复用，lipo 阶段报 cputype 不一致。每个 ABI 构建前先 clean。
-        if len(getattr(ctx, "abis", [abi])) > 1:
-            toolchain.sh(f"make OS=ios ARCH={arch} clean", cwd=src, abi=abi,
-                         log_name=f"openh264-{abi}-clean", check=False, quiet=True)
+        # 每个 ABI 已经是 _in_source_copy 隔离出的独立源码副本，不会再出现多 ABI
+        # 共用同一份源码树互相踩到残留目标文件的问题，构建前无需再 make clean
         script = (f"make -j{ctx.jobs} OS=ios ARCH={arch} "
                   f"SDK_MIN={toolchain.min_version} install-static PREFIX={stage}")
 

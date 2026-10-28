@@ -175,8 +175,16 @@ class Toolchain:
 
     # 执行
     def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
-        """返回 (argv, 子进程 cwd)。"""
-        return ["/bin/bash", "-lc", script], cwd
+        """返回 (argv, 子进程 cwd)。
+
+        不能用登录 shell（``-l``）：macOS 的 ``/etc/profile`` 会跑 ``path_helper``，
+        把 PATH 按 ``/etc/paths`` 重新排序，系统 ``/usr/bin`` 会被排到我们在
+        ``build_env()`` 里手动前置的交叉编译工具链（NDK clang 等）前面——
+        表现为 ``which clang`` 命中系统 clang，而不是 NDK 里的那个，进而让
+        openssl Configure 之类按路径特征识别工具链的逻辑误判成"NDK 不完整"。
+        普通 ``-c`` 不会触发 path_helper，PATH 完全听 build_env() 的安排。
+        """
+        return ["/bin/bash", "-c", script], cwd
 
     def sh(self, script: str, cwd: Path, abi: str, env: Optional[Dict[str, str]] = None, **kw):
         argv, effective_cwd = self.shell_command(script, cwd, abi)
@@ -447,9 +455,15 @@ class AndroidToolchain(Toolchain):
     def toolchain_bin(self) -> Path:
         return self.ndk / "toolchains" / "llvm" / "prebuilt" / self.host_tag / "bin"
 
+    @property
+    def sysroot(self) -> Path:
+        # sysroot 与 bin 是 llvm/prebuilt/<host>/ 下的平级目录（不是 bin/sysroot）；
+        # 写错会导致链接期找不到 crtbegin_dynamic.o 等启动对象，报 "cannot open" 致命错误
+        return self.toolchain_bin.parent / "sysroot"
+
     def build_env(self, abi: str) -> Dict[str, str]:
         spec = ANDROID_ABI[abi]
-        bin_dir, sysroot = self.toolchain_bin, self.toolchain_bin / "sysroot"
+        bin_dir, sysroot = self.toolchain_bin, self.sysroot
         env = os.environ.copy()
         env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
         env.update({
@@ -744,7 +758,8 @@ class OHOSToolchain(Toolchain):
         return which("bash") or ""
 
     def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
-        return [self._find_bash() or "/bin/bash", "-lc", script], cwd
+        # 同 Toolchain.shell_command：避免登录 shell 触发 macOS path_helper 打乱 PATH 顺序
+        return [self._find_bash() or "/bin/bash", "-c", script], cwd
 
 
 # ------------------------------------------------------------------ Linux
