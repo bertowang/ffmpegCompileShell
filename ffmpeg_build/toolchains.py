@@ -39,13 +39,17 @@ class ToolchainError(RuntimeError):
 
 # ------------------------------------------------------------------ MSVC
 class MSVC:
-    """一次 ``vcvarsall.bat`` 的环境抓取结果。"""
+    """一次 ``vcvarsall.bat`` 的环境抓取结果（一个目标架构一份）。"""
 
-    def __init__(self, install: Path, vcvarsall: Path, env: Dict[str, str], year: str):
+    # vcvarsall 一次要几秒；bootstrap 自检 + prepare 会对同一架构反复探测，按参数缓存
+    _cache: Dict[str, Optional["MSVC"]] = {}
+
+    def __init__(self, install: Path, vcvarsall: Path, env: Dict[str, str], year: str, arch: str = "x64"):
         self.install = install
         self.vcvarsall = vcvarsall
         self.env = env
         self.year = year
+        self.arch = arch
 
     @property
     def generator(self) -> Optional[str]:
@@ -53,17 +57,19 @@ class MSVC:
 
     @classmethod
     def discover(cls, logger, arch: str = "x64") -> Optional["MSVC"]:
+        """``arch`` 是 vcvarsall 的参数：x64 / x86 / arm64，或交叉形式 x64_x86 / x64_arm64。"""
+        if arch in cls._cache:
+            return cls._cache[arch]
+        result = None
         install = cls._find_installation()
-        if not install:
-            return None
-        vcvarsall = install / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
-        if not vcvarsall.exists():
-            return None
-        env = cls._capture_env(vcvarsall, arch)
-        if not env or not which("cl", env):
-            return None
-        year = next((p for p in install.parts if p in ("2022", "2019", "2017")), "2022")
-        return cls(install, vcvarsall, env, year)
+        vcvarsall = install / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat" if install else None
+        if vcvarsall and vcvarsall.exists():
+            env = cls._capture_env(vcvarsall, arch)
+            if env and which("cl", env):
+                year = next((p for p in install.parts if p in ("2022", "2019", "2017")), "2022")
+                result = cls(install, vcvarsall, env, year, arch)
+        cls._cache[arch] = result
+        return result
 
     @staticmethod
     def _find_installation() -> Optional[Path]:
@@ -193,9 +199,42 @@ class Toolchain:
     def run(self, cmd, cwd: Path, abi: str, env: Optional[Dict[str, str]] = None, **kw):
         return self.runner.run(list(cmd), cwd=cwd, env=env or self.build_env(abi), **kw)
 
-    # 产物
+    # ABI 解析（各平台共用一套规则，只差下面三张表）
+    #: 本平台全部合法 ABI（顺序即 ``all`` 展开后的构建顺序）
+    supported_abis: List[str] = []
+    #: ``all`` / ``*`` 展开成哪些；None 表示等于 supported_abis
+    all_abis: Optional[List[str]] = None
+    #: 别名 -> 若干 ABI（如 iOS 的 device / simulator / fat）
+    abi_aliases: Dict[str, List[str]] = {}
+
     def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
-        return requested or list(self.default_abis)
+        """``--abi`` 统一解析：空格或逗号分隔都行，支持 ``all`` 与平台别名，去重保序。
+
+        不认识的值**直接报错**：以前 Windows 会把非法值悄悄丢掉回落成 x64，
+        ``--abi x64,x86`` 这种写法也被整体当成非法值吞掉，结果只编了 x64 却没有任何提示。
+        """
+        items = [part.strip() for raw in (requested or []) for part in str(raw).split(",") if part.strip()]
+        if not items:
+            return list(self.default_abis)
+        expanded: List[str] = []
+        unknown: List[str] = []
+        for item in items:
+            key = item.lower()
+            if key in ("all", "*"):
+                expanded += list(self.all_abis if self.all_abis is not None else self.supported_abis)
+            elif key in self.abi_aliases:
+                expanded += self.abi_aliases[key]
+            elif item in self.supported_abis:
+                expanded.append(item)
+            else:
+                unknown.append(item)
+        if unknown:
+            choices = list(self.supported_abis) + list(self.abi_aliases) + ["all"]
+            raise ToolchainError(f"{self.name} ABI", f"不支持: {', '.join(unknown)}",
+                                 f"可选: {', '.join(choices)}（多个值用空格或逗号分隔）")
+        return list(dict.fromkeys(expanded))
+
+    # 产物
 
     def finalize(self, lib: str, stages: Dict[str, Path]) -> Path:
         """按布局落盘：flat 直放、lib 把 lib/* 收到 lib/<abi>/、abi 放到 <平台>/<abi>。"""
@@ -240,11 +279,55 @@ class Toolchain:
 
 
 # ------------------------------------------------------------------ Windows
+# 每个 ABI 一整套参数：vcvarsall 的目标架构、CMake VS 生成器的 -A、openssl 的 Configure target、
+# ffmpeg 的 --arch/--target-os、openh264 的 ARCH。以前这几处都写死成 x64，
+# --abi x86/arm64 编出来的仍是 x64 二进制，只是被放进了 x86/arm64 目录。
+WINDOWS_ABI = {
+    "x64": {"target": "x64", "cmake_platform": "x64", "openssl": "VC-WIN64A",
+            "ffmpeg_arch": "x86_64", "ffmpeg_os": "win64", "openh264": "x86_64", "nasm": True},
+    "x86": {"target": "x86", "cmake_platform": "Win32", "openssl": "VC-WIN32",
+            "ffmpeg_arch": "x86", "ffmpeg_os": "win32", "openh264": "x86", "nasm": True},
+    "arm64": {"target": "arm64", "cmake_platform": "ARM64", "openssl": "VC-WIN64-ARM",
+              "ffmpeg_arch": "aarch64", "ffmpeg_os": "win64", "openh264": "arm64", "nasm": False},
+}
+# platform.machine() -> vcvarsall 的宿主架构名
+WINDOWS_HOST_ARCH = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64",
+                     "x86": "x86", "i386": "x86", "i686": "x86"}
+
+
+def windows_host_arch() -> str:
+    return WINDOWS_HOST_ARCH.get(platform_mod.machine().lower(), "x64")
+
+
+def vcvars_arch(abi: str, host: Optional[str] = None) -> str:
+    """vcvarsall 的参数：宿主与目标相同写 ``x64``，不同写交叉形式 ``x64_arm64``。"""
+    host = host or windows_host_arch()
+    target = WINDOWS_ABI[abi]["target"]
+    return target if host == target else f"{host}_{target}"
+
+
+def msvc_targets(msvc: Optional[MSVC], abi: str) -> bool:
+    """vcvarsall 找不到对应架构的组件时有可能"成功返回"但仍给出别的 cl，按 cl 所在目录核对。
+
+    cl 位于 ``...\\bin\\Host<宿主>\\<目标>\\cl.exe``，目标目录名与 WINDOWS_ABI 的 target 一致。
+    """
+    if not msvc:
+        return False
+    cl = which("cl", msvc.env)
+    return bool(cl) and Path(cl).parent.name.lower() == WINDOWS_ABI[abi]["target"]
+
+
+def gas_preprocessor(env: Optional[Dict[str, str]] = None) -> str:
+    """MSVC 下编 ARM64 汇编（ffmpeg / openh264）需要 gas-preprocessor.pl + armasm64。"""
+    return which("gas-preprocessor.pl", env) or ""
+
+
 class WindowsToolchain(Toolchain):
     """优先微软编译套件：MSVC + MSYS2(GNU make/install/perl/nasm)。"""
 
     name = "windows"
     default_abis = ["x64"]
+    supported_abis = list(WINDOWS_ABI)
     use_abi_dir = True
     shell_path_separator = ":"
 
@@ -253,7 +336,8 @@ class WindowsToolchain(Toolchain):
         self.prefer = prefer
         self.crt = (getattr(ctx, "crt", "mt") or "mt").lower()
         self.compiler_id = "msvc"          # prepare() 中按实际探测结果修正
-        self.msvc: Optional[MSVC] = None
+        self.msvc: Optional[MSVC] = None   # 第一个 ABI 的环境（兼容旧调用方）
+        self.msvc_by_abi: Dict[str, MSVC] = {}
         self.msys2_root: Optional[Path] = None
         self.msys2_bins: List[str] = []
         self.ninja = self.cmake = None
@@ -261,16 +345,31 @@ class WindowsToolchain(Toolchain):
     def prepare(self) -> None:
         self._detect_msys2()
         if self.prefer in ("auto", "msvc"):
-            self.msvc = MSVC.discover(self.logger)
+            missing = []
+            for abi in self.ctx.abis:
+                msvc = MSVC.discover(self.logger, vcvars_arch(abi))
+                if msvc_targets(msvc, abi):
+                    self.msvc_by_abi[abi] = msvc
+                else:
+                    missing.append(abi)
+            if missing and self.msvc_by_abi:
+                # 有 MSVC，但缺某个目标架构的编译器组件：直接报错，绝不拿别的架构顶替
+                raise ToolchainError(
+                    "MSVC", f"VS 未安装 {', '.join(missing)} 目标的编译器（vcvarsall "
+                    f"{', '.join(vcvars_arch(a) for a in missing)} 失败）",
+                    "VS Installer → 单个组件：x86 选 'MSVC v143 - VS 2022 C++ x64/x86 生成工具'，"
+                    "arm64 选 'MSVC v143 - VS 2022 C++ ARM64/ARM64EC 生成工具'")
+            self.msvc = self.msvc_by_abi.get(self.ctx.abis[0])
         if self.msvc:
             self.compiler_id = "msvc"
-            self.logger.info(f"MSVC: {self.msvc.install} (cl={which('cl', self.msvc.env)})")
+            for abi, msvc in self.msvc_by_abi.items():
+                self.logger.info(f"MSVC[{abi}]: {msvc.install} (vcvarsall {msvc.arch}, cl={which('cl', msvc.env)})")
         else:
             self.compiler_id = "mingw"
         if not self.msvc and self.prefer == "msvc":
             raise ToolchainError("MSVC", "未检测到 VS / VS Build Tools",
                                  "python build.py bootstrap --platform windows --install")
-        elif not (which("gcc") or (self.msys2_root and (self.msys2_root / "mingw64" / "bin" / "gcc.exe").exists())):
+        elif not self.msvc and not (which("gcc") or (self.msys2_root and (self.msys2_root / "mingw64" / "bin" / "gcc.exe").exists())):
             raise ToolchainError("MSVC/MinGW", "既无 MSVC 也无 MinGW",
                                  "安装 VS Build Tools 或 MSYS2")
 
@@ -282,6 +381,9 @@ class WindowsToolchain(Toolchain):
         if not which("make", env):
             raise ToolchainError("make", "openh264 的 Makefile 需要 GNU make",
                                  "MSYS2: pacman -S make，或 winget install MSYS2.MSYS2")
+        if "arm64" in self.ctx.abis and not gas_preprocessor(env):
+            self.logger.warn("未找到 gas-preprocessor.pl：arm64 的 ffmpeg 将 --disable-asm、openh264 将 USE_ASM=No"
+                             "（能编出可用产物，但没有 NEON 汇编优化）")
         self.logger.info(f"工具链就绪: cmake={self.cmake} ninja={self.ninja or '-'}")
 
     def _detect_msys2(self) -> None:
@@ -294,8 +396,13 @@ class WindowsToolchain(Toolchain):
                     self.msys2_bins.append(str(root / "mingw64" / "bin"))
                 return
 
+    def msvc_for(self, abi: Optional[str]) -> Optional[MSVC]:
+        """该 ABI 对应的 vcvarsall 环境（x86 / arm64 的 cl、LIB、INCLUDE 都与 x64 不同）。"""
+        return self.msvc_by_abi.get(abi or "") or self.msvc
+
     def build_env(self, abi: str = "x64") -> Dict[str, str]:
-        base = dict(self.msvc.env) if self.msvc else os.environ.copy()
+        msvc = self.msvc_for(abi)
+        base = dict(msvc.env) if msvc else os.environ.copy()
         # cl 的诊断信息会跟随系统语言：中文语言包下 -showIncludes 输出的是
         # "注意: 包含文件:"，而 ffmpeg 的 ffbuild/common.mak 只按英文
         # "Note: including file:" 做 sed 提取 —— 结果所有 C/C++ 的 .d 依赖文件都是
@@ -317,11 +424,19 @@ class WindowsToolchain(Toolchain):
         return base
 
     def cmake_args(self, abi: str = "x64") -> List[str]:
+        spec = WINDOWS_ABI.get(abi, WINDOWS_ABI["x64"])
+        msvc = self.msvc_for(abi)
+        # Ninja：目标架构由该 ABI 的 vcvarsall 环境（cl 本身）决定；
+        # VS 生成器：不吃 vcvars 环境，必须用 -A 指定平台
         args = ["-G", "Ninja"] if self.ninja else []
-        if not self.ninja and self.msvc and self.msvc.generator:
-            args = ["-G", self.msvc.generator, "-A", "x64"]
+        if not self.ninja and msvc and msvc.generator:
+            args = ["-G", msvc.generator, "-A", spec["cmake_platform"]]
+        if self.ninja and spec["target"] != windows_host_arch() and spec["target"] == "arm64":
+            # 交叉到 ARM64：CMake 默认把 CMAKE_SYSTEM_PROCESSOR 设成宿主 AMD64，
+            # libyuv 等按它决定是否编 NEON 内核 —— 必须显式告诉 CMake 目标处理器
+            args += ["-DCMAKE_SYSTEM_NAME=Windows", "-DCMAKE_SYSTEM_PROCESSOR=ARM64"]
         args += ["-DCMAKE_BUILD_TYPE=Release"]
-        if self.msvc:
+        if msvc:
             # 默认 /MT，与 openssl/ffmpeg 一致（否则 ffmpeg 链接时 CRT 打架）；
             # --crt md 给 /MD 的消费方（如 ESMediaX），典型只用于应用直链的库（spdlog/libyuv/json）
             args += [
@@ -352,23 +467,24 @@ class WindowsToolchain(Toolchain):
     def shell_command(self, script: str, cwd: Optional[Path], abi: Optional[str] = None):
         """MSYS2 登录 shell 不继承 Windows cwd，且会重排 PATH。
 
-        因此脚本内必须做两件事：cd 到工作目录（/d/... 形式），并把 MSVC 路径以
-        POSIX 形式（/c/...）置顶，否则 make 找不到 cl.exe。
+        因此脚本内必须做两件事：cd 到工作目录（/d/... 形式），并把**该 ABI 的** MSVC
+        路径以 POSIX 形式（/c/...）置顶，否则 make 找不到 cl.exe（或找到别的架构的 cl）。
         """
-        prefix = self._msvc_path_prefix()
+        prefix = self._msvc_path_prefix(abi)
         if prefix:
             script = f'export PATH="{prefix}:$PATH" && {script}'
         if cwd:
             script = f'cd "{to_msys_path(cwd)}" && {script}'
         return [self._bash(), "-lc", script], None
 
-    def _msvc_path_prefix(self) -> str:
-        if not self.msvc:
+    def _msvc_path_prefix(self, abi: Optional[str] = None) -> str:
+        msvc = self.msvc_for(abi)
+        if not msvc:
             return ""
         base = {p.rstrip("\\/").lower() for p in os.environ.get("PATH", "").split(os.pathsep)}
         entries = [
             to_msys_path(entry)
-            for entry in self.msvc.env.get("PATH", "").split(os.pathsep)
+            for entry in msvc.env.get("PATH", "").split(os.pathsep)
             if entry and entry.rstrip("\\/").lower() not in base
         ]
         if self.msys2_root:
@@ -386,10 +502,6 @@ class WindowsToolchain(Toolchain):
     def msys_path(self, path) -> str:
         return to_msys_path(path)
 
-    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
-        valid = [a for a in (requested or []) if a in ("x64", "x86", "arm64")]
-        return valid or list(self.default_abis)
-
 
 # ------------------------------------------------------------------ Android
 ANDROID_ABI = {
@@ -403,6 +515,9 @@ NDK_HOST = {"Darwin": "darwin-x86_64", "Windows": "windows-x86_64", "Linux": "li
 class AndroidToolchain(Toolchain):
     name = "android"
     default_abis = ["arm64-v8a"]
+    supported_abis = list(ANDROID_ABI)
+    # all 只展开真机 ABI；x86_64（模拟器）要显式写
+    all_abis = ["arm64-v8a", "armeabi-v7a"]
 
     def __init__(self, ctx, ndk: Optional[str] = None, api: int = 21):
         super().__init__(ctx)
@@ -485,19 +600,15 @@ class AndroidToolchain(Toolchain):
             "-DANDROID_STL=c++_static", "-DANDROID_ARM_NEON=ON", "-DCMAKE_BUILD_TYPE=Release",
         ]
 
-    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
-        if not requested:
-            return list(self.default_abis)
-        expanded: List[str] = []
-        for item in requested:
-            expanded += ["arm64-v8a", "armeabi-v7a"] if item in ("all", "*") else [item]
-        return expanded or list(self.default_abis)
-
 
 # ------------------------------------------------------------------ iOS
 class IOSToolchain(Toolchain):
     name = "ios"
     default_abis = ["arm64", "x86_64"]
+    # openssl 有对应 target 的 ABI（见 recipes.IOS_OPENSSL_TARGETS）
+    supported_abis = ["arm64", "x86_64", "arm64-simulator"]
+    all_abis = ["arm64", "x86_64"]
+    abi_aliases = {"fat": ["arm64", "x86_64"], "device": ["arm64"], "simulator": ["x86_64"]}
     use_abi_dir = False          # 产物为 fat 库
 
     def __init__(self, ctx, min_version: str = "12.0"):
@@ -550,21 +661,6 @@ class IOSToolchain(Toolchain):
                 f"-DCMAKE_OSX_SYSROOT={self.sdk_name(abi)}",
                 f"-DCMAKE_OSX_ARCHITECTURES={abi.replace('-simulator', '')}",
                 f"-DCMAKE_OSX_DEPLOYMENT_TARGET={self.min_version}", "-DCMAKE_BUILD_TYPE=Release"]
-
-    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
-        if not requested:
-            return list(self.default_abis)
-        expanded: List[str] = []
-        for item in requested:
-            if item in ("fat", "all", "*"):
-                expanded += list(self.default_abis)
-            elif item == "device":
-                expanded.append("arm64")
-            elif item == "simulator":
-                expanded.append("x86_64")
-            else:
-                expanded.append(item)
-        return list(dict.fromkeys(expanded)) or list(self.default_abis)
 
     def finalize(self, lib: str, stages: Dict[str, Path]) -> Path:
         """多架构 -> lipo 合并为 fat 库。"""
@@ -619,6 +715,7 @@ OHOS_SDK_GLOBS = (
 class OHOSToolchain(Toolchain):
     name = "ohos"
     default_abis = ["arm64-v8a"]
+    supported_abis = list(OHOS_ABI)
 
     def __init__(self, ctx, sdk: Optional[str] = None):
         super().__init__(ctx)
@@ -739,14 +836,6 @@ class OHOSToolchain(Toolchain):
             "-DCMAKE_BUILD_TYPE=Release",
         ]
 
-    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
-        if not requested:
-            return list(self.default_abis)
-        expanded: List[str] = []
-        for item in requested:
-            expanded += list(OHOS_ABI) if item in ("all", "*") else [item]
-        return expanded or list(self.default_abis)
-
     # 执行：Linux/macOS 用系统 bash；Windows 用 MSYS2/Git Bash
     def _find_bash(self) -> str:
         if platform_mod.system() != "Windows":
@@ -779,6 +868,7 @@ LINUX_HOST_ARCH = {"x86_64": "x86_64", "amd64": "x86_64",
 class LinuxToolchain(Toolchain):
     name = "linux"
     default_abis = [LINUX_HOST_ARCH.get(platform_mod.machine(), "x86_64")]
+    supported_abis = list(LINUX_ABI)
     use_abi_dir = True
 
     def __init__(self, ctx):
@@ -823,14 +913,6 @@ class LinuxToolchain(Toolchain):
     def cmake_args(self, abi: str) -> List[str]:
         return ["-G", "Unix Makefiles", "-DCMAKE_BUILD_TYPE=Release",
                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
-
-    def expand_abis(self, requested: Optional[List[str]]) -> List[str]:
-        if not requested:
-            return list(self.default_abis)
-        expanded: List[str] = []
-        for item in requested:
-            expanded += list(LINUX_ABI) if item in ("all", "*") else [item]
-        return expanded or list(self.default_abis)
 
 
 TOOLCHAINS = {"windows": WindowsToolchain, "android": AndroidToolchain,

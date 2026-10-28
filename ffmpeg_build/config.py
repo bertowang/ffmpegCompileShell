@@ -250,8 +250,9 @@ CAPTURE_WHITELIST: Dict[str, object] = {
     "platform_encoders": {"windows": [], "android": ["h264_mediacodec"], "ios": ["h264_videotoolbox"]},
     "decoders": ["h264", "aac", "png"],
     "muxers": ["flv", "mpegts"],
-    # image2 / image_png_pipe：水印 logo 之类的 png 图片要经 avformat 打开
-    "demuxers": ["mov", "flv", "mp4", "image2", "image_png_pipe"],
+    # image2 / image_png_pipe：水印 logo 之类的 png 图片要经 avformat 打开；
+    # mp4/m4a 由 mov 解封装器处理（ffmpeg 没有叫 mp4 的 demuxer，写了会被 configure 忽略）
+    "demuxers": ["mov", "flv", "image2", "image_png_pipe"],
     "parsers": ["h264", "aac"],
     "bsfs": ["h264_mp4toannexb", "aac_adtstoasc", "null"],
     "filters": list(CAPTURE_FILTERS),
@@ -267,7 +268,9 @@ PLAYER_WHITELIST: Dict[str, object] = {
     "platform_encoders": {},
     "decoders": ["h264", "hevc", "aac", "mp3", "png", "mjpeg"],
     "muxers": [],
-    "demuxers": ["mov", "mp4", "flv", "mkv", "mpegts", "hls"],
+    # 写 configure 的内部名：mov 覆盖 mp4/m4a/3gp/mov，matroska 覆盖 mkv/webm
+    # （mp4 / mkv 不是 demuxer 名，configure 只打个 WARNING 就忽略，产物里就没有）
+    "demuxers": ["mov", "flv", "matroska", "mpegts", "hls"],
     "parsers": ["h264", "hevc", "aac", "mpegaudio"],
     "bsfs": ["h264_mp4toannexb", "hevc_mp4toannexb", "aac_adtstoasc", "null"],
     "filters": ["null", "anull", "format", "aformat", "scale", "aresample", "rotate", "transpose"],

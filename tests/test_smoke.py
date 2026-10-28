@@ -73,7 +73,12 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(player["encoders"], [])          # 播放不编码 → 不生成 --enable-encoder
         self.assertEqual(player["muxers"], [])
         self.assertIn("hevc", player["decoders"])
-        self.assertIn("mkv", player["demuxers"])
+        # 白名单写的是 ffmpeg 组件名（allformats.c）：mkv/mp4 不是 demuxer 名，分别是 matroska/mov
+        self.assertIn("matroska", player["demuxers"])
+        self.assertIn("mov", player["demuxers"])
+        for wl in (capture, player):
+            self.assertNotIn("mkv", wl["demuxers"])
+            self.assertNotIn("mp4", wl["demuxers"])
         # 开播的 ffmpeg 外部库开关来自锁定文件的 ffmpeg_deps 组（不再是硬编码）
         self.assertEqual(sorted(FFMPEG_DEP_FLAGS),
                          ["--enable-libfdk-aac", "--enable-libopenh264", "--enable-libsrt",

@@ -146,6 +146,7 @@ def build_openssl(ctx, abi: str) -> Path:
     toolchain, platform = ctx.toolchain, ctx.platform
 
     if platform == "windows":
+        from .toolchains import WINDOWS_ABI
         env = toolchain.build_env(abi)
         perl = _native_perl(toolchain)
         if not perl:
@@ -154,11 +155,18 @@ def build_openssl(ctx, abi: str) -> Path:
         if not nmake:
             raise RuntimeError("openssl 需要 MSVC 的 nmake")
         prefix = str(stage).replace("\\", "/")
-        ctx.runner.run([perl, "Configure", "VC-WIN64A", *OPENSSL_OPTIONS,
+        # target 按 ABI 选（x64=VC-WIN64A / x86=VC-WIN32 / arm64=VC-WIN64-ARM），
+        # 不能写死 VC-WIN64A：否则 x86/arm64 的 vcvars 环境下要么链接失败、要么产出 x64 库
+        options = list(OPENSSL_OPTIONS)
+        if not WINDOWS_ABI[abi]["nasm"]:
+            # ARM64 的汇编走 armasm64 + perlasm 的 win64 方言，各 openssl 版本支持程度不一；
+            # 只做 RTMPS/TLS，用 C 实现足够，换来"装了 ARM64 组件就能编过"的确定性
+            options.append("no-asm")
+        ctx.runner.run([perl, "Configure", WINDOWS_ABI[abi]["openssl"], *options,
                         f"--prefix={prefix}", f"--openssldir={prefix}/ssl"],
-                       cwd=src, env=env, log_name="openssl-configure")
-        ctx.runner.run([nmake], cwd=src, env=env, log_name="openssl-build")
-        ctx.runner.run([nmake, "install_sw"], cwd=src, env=env, log_name="openssl-install")
+                       cwd=src, env=env, log_name=f"openssl-{abi}-configure")
+        ctx.runner.run([nmake], cwd=src, env=env, log_name=f"openssl-{abi}-build")
+        ctx.runner.run([nmake, "install_sw"], cwd=src, env=env, log_name=f"openssl-{abi}-install")
     else:
         if platform == "android":
             from .toolchains import ANDROID_ABI
@@ -265,9 +273,12 @@ def build_openh264(ctx, abi: str) -> Path:
         _hide_symbols(ctx, src)
 
     if platform == "windows":
-        # openh264 的 ARCH 用 x86_64/x86/arm64 命名（不是 VS 的 x64）
-        arch = {"x64": "x86_64", "x86": "x86", "arm64": "arm64"}.get(abi, "x86_64")
-        script = (f"make -j{ctx.jobs} OS=msvc ARCH={arch} USE_ASM=Yes BUILDTYPE=Release "
+        from .toolchains import WINDOWS_ABI, gas_preprocessor
+        spec = WINDOWS_ABI[abi]
+        # openh264 的 ARCH 用 x86_64/x86/arm64 命名（不是 VS 的 x64）；
+        # x86/x64 汇编用 nasm，arm64 汇编要 gas-preprocessor.pl + armasm64，缺了就关汇编
+        use_asm = "Yes" if spec["nasm"] or gas_preprocessor(toolchain.build_env(abi)) else "No"
+        script = (f"make -j{ctx.jobs} OS=msvc ARCH={spec['openh264']} USE_ASM={use_asm} BUILDTYPE=Release "
                   f"install-static PREFIX={toolchain.msys_path(stage)}")
     elif platform == "android":
         from .toolchains import ANDROID_ABI
@@ -353,6 +364,8 @@ def build_libyuv(ctx, abi: str) -> Path:
         if built:
             break
     if not built:
+        if ctx.dry_run:              # dry-run 只打印命令，本来就没有产物
+            return stage
         raise RuntimeError(f"libyuv 静态库未生成: {build_dir}")
     shutil.copy2(built[0], lib_dir / built[0].name)
     if ctx.platform == "android" and not (lib_dir / "libyuv_static.a").exists():
@@ -589,6 +602,60 @@ def _ensure_build_dir(work_dir: Path, configure_args: List[str], ctx) -> Path:
     return build_dir
 
 
+# ---------------------------------------------------------------- 白名单校验
+# configure 对 --enable-demuxer=mkv 这种**不存在的组件名**只打一行 WARNING 然后忽略，
+# 产物里静默缺组件，要到运行期打开文件才暴露（交叉编译平台连构建后的自检都跑不了）。
+# 组件名的唯一来源是源码里的登记表，与 configure 自己的 find_things_extern 同一套规则。
+_COMPONENT_REGISTRY = {
+    # 白名单键: (登记文件, 正则 —— 第 1 组为 configure 使用的组件名)
+    "encoders": ("libavcodec/allcodecs.c", r"^extern const \w+ ff_(\w+)_encoder;"),
+    "decoders": ("libavcodec/allcodecs.c", r"^extern const \w+ ff_(\w+)_decoder;"),
+    "parsers": ("libavcodec/parsers.c", r"^extern const \w+ ff_(\w+)_parser;"),
+    "bsfs": ("libavcodec/bitstream_filters.c", r"^extern const \w+ ff_(\w+)_bsf;"),
+    "muxers": ("libavformat/allformats.c", r"^extern const \w+ +ff_(\w+)_muxer;"),
+    "demuxers": ("libavformat/allformats.c", r"^extern const \w+ +ff_(\w+)_demuxer;"),
+    "protocols": ("libavformat/protocols.c", r"^extern const \w+ ff_(\w+)_protocol;"),
+    "filters": ("libavfilter/allfilters.c", r"^extern const \w+ ff_(?:[avfsinkrc]{2,5})_(\w+);"),
+}
+
+
+def ffmpeg_component_names(src: Path, key: str) -> Optional[set]:
+    """源码登记的某类组件名集合；登记文件不存在（源码未就绪 / dry-run）返回 None。"""
+    rel, pattern = _COMPONENT_REGISTRY[key]
+    path = Path(src) / rel
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return set(re.findall(pattern, text, flags=re.MULTILINE))
+
+
+def validate_whitelist(ctx, src: Path) -> None:
+    """白名单里每个名字都必须是该 ffmpeg 源码里真实存在的组件，否则 configure 前就报错。"""
+    profile = getattr(ctx, "profile", "")
+    wl = C.whitelist(profile)
+    wanted = {key: list(wl.get(key) or []) for key in _COMPONENT_REGISTRY}
+    wanted["encoders"] = C.whitelist_encoders(ctx.platform, profile, ctx.enable_nvenc, ctx.enable_amf)
+    wanted["bsfs"] = C.whitelist_bsfs(profile)
+    problems = []
+    for key, names in wanted.items():
+        known = ffmpeg_component_names(src, key)
+        if known is None:
+            continue
+        if not known:
+            # 登记表格式变了（换了 ffmpeg 大版本 / fork）：宁可跳过也不误报
+            ctx.logger.warn(f"白名单校验跳过 {key}：{_COMPONENT_REGISTRY[key][0]} 里没解析出任何组件名")
+            continue
+        unknown = [n for n in names if n and n not in known]
+        if unknown:
+            problems.append(f"{key}: {', '.join(unknown)}")
+    if problems:
+        raise RuntimeError(
+            "ffmpeg 裁剪白名单里有源码中不存在的组件名（configure 会静默忽略，产物缺组件）：\n  "
+            + "\n  ".join(problems)
+            + "\n  请改用 configure 的内部名（如 mp4/m4a → mov，mkv/webm → matroska，srt 协议 → libsrt），"
+              "见 ffmpeg_build/config.py 的 PROFILE_WHITELIST")
+
+
 def build_ffmpeg(ctx, abi: str) -> Path:
     _set_current("ffmpeg")
     stage = ensure_dir(ctx.stage_dir("ffmpeg", abi))
@@ -604,6 +671,7 @@ def build_ffmpeg(ctx, abi: str) -> Path:
         source = replace(source, ref=ctx.ffmpeg_ref)
     src = ctx.sources.ensure(source, ctx.source_dir("ffmpeg"), ctx.force_fetch)
     pruned = prune_source_tree(src, ctx.logger)
+    validate_whitelist(ctx, src)
 
     prefixes = _dependency_prefixes(ctx, abi)
     args = _ffmpeg_common_args(ctx, abi, stage, prefixes)
@@ -646,10 +714,18 @@ def build_ffmpeg(ctx, abi: str) -> Path:
         for import_lib in bin_dir.glob("*.lib"):
             if not (lib_dir / import_lib.name).exists():
                 shutil.copy2(import_lib, lib_dir / import_lib.name)
-    # 本机平台的产物能直接跑，顺手体检一次；交叉编译产物跳过
-    if ctx.platform in NATIVE_VERIFY_PLATFORMS:
+    # 本机平台的产物能直接跑，顺手体检一次；交叉编译产物（含 x64 宿主上的 Windows arm64）跳过
+    if ctx.platform in NATIVE_VERIFY_PLATFORMS and _runs_on_host(ctx, abi):
         _verify_components(ctx, stage)
     return stage
+
+
+def _runs_on_host(ctx, abi: str) -> bool:
+    if ctx.platform == "windows":
+        from .toolchains import WINDOWS_ABI, windows_host_arch
+        # x64 宿主能跑 x86（WOW64），跑不了 arm64；arm64 宿主三种都能跑（仿真）
+        return WINDOWS_ABI[abi]["target"] != "arm64" or windows_host_arch() == "arm64"
+    return True
 
 
 # 运行期组件自检：白名单里写了、但二进制没登记（GPL 冲突/依赖缺失/组件表被旧文件覆盖）
@@ -865,10 +941,18 @@ def _ffmpeg_common_args(ctx, abi, stage: Path, prefixes) -> List[str]:
 
 def _ffmpeg_platform_args(ctx, abi) -> List[str]:
     if ctx.platform == "windows":
-        args = ["--target-os=win64", "--arch=x86_64", "--toolchain=msvc",
+        from .toolchains import WINDOWS_ABI, gas_preprocessor, windows_host_arch
+        spec = WINDOWS_ABI[abi]
+        args = [f"--target-os={spec['ffmpeg_os']}", f"--arch={spec['ffmpeg_arch']}", "--toolchain=msvc",
                 "--enable-shared", "--disable-static",
                 # openssl 在 Windows 不装 .pc，静态链接所需系统库需显式给出
                 "--extra-libs='-lws2_32 -lgdi32 -lcrypt32 -ladvapi32 -luser32'"]
+        if spec["target"] != windows_host_arch() and spec["target"] == "arm64":
+            # x64 宿主跑不了 arm64 的测试程序；x86 产物 x64 宿主能直接跑，不算交叉编译
+            args.append("--enable-cross-compile")
+        if not spec["nasm"] and not gas_preprocessor(ctx.toolchain.build_env(abi)):
+            # MSVC 编 ARM64 汇编要 gas-preprocessor.pl 转成 armasm64 语法，缺了就整体关汇编
+            args.append("--disable-asm")
         # 硬编开关与附加开关都来自锁定文件（extra_flags 里带 --enable-d3d11va：
         # AMF 走 D3D11，采集链路本就是 D3D11/DXGI，直传显存帧时必须有它）
         for enabled, name, fallback in ((ctx.enable_nvenc, "nv-codec-headers", "--enable-nvenc"),

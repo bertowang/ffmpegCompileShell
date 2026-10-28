@@ -61,8 +61,9 @@ def tools_root() -> Path:
 # ------------------------------------------------------------------- 检查
 def check(platform: str, logger: Logger, ctx=None) -> CheckResult:
     result = CheckResult(platform=platform)
+    abis = list(getattr(ctx, "abis", None) or [])
     if platform == "windows":
-        result.statuses = _check_windows(logger)
+        result.statuses = _check_windows(logger, abis)
     elif platform == "android":
         result.statuses = _check_android(ctx)
     elif platform == "ohos":
@@ -70,27 +71,44 @@ def check(platform: str, logger: Logger, ctx=None) -> CheckResult:
     elif platform == "linux":
         result.statuses = _check_linux()
     else:
-        result.statuses = _check_ios()
+        result.statuses = _check_ios(abis)
     return result
 
 
-def _check_windows(logger: Logger) -> List[ToolStatus]:
+def _check_windows(logger: Logger, abis: Optional[List[str]] = None) -> List[ToolStatus]:
+    from .toolchains import WINDOWS_ABI, msvc_targets, vcvars_arch
     tools = tools_root()
-    msvc = MSVC.discover(logger)
+    abis = abis or ["x64"]
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([str(tools / "nasm"), str(tools / "cmake" / "bin"), env.get("PATH", "")])
     bash = next((str(Path(r) / "usr" / "bin" / "bash.exe") for r in MSYS2_CANDIDATES
                  if (Path(r) / "usr" / "bin" / "bash.exe").exists()), "")
-    return [
-        ToolStatus("MSVC(VS Build Tools)", bool(msvc), str(msvc.install) if msvc else "",
-                   f"winget install {VS_BUILDTOOLS_WINGET} 或 {VS_BUILDTOOLS_URL}"),
+    # 每个目标 ABI 单独核对一次：只装了 x64 组件时，x86/arm64 必须在自检阶段就报出来
+    statuses = []
+    for abi in abis:
+        msvc = MSVC.discover(logger, vcvars_arch(abi))
+        ok = msvc_targets(msvc, abi)
+        component = ("Microsoft.VisualStudio.Component.VC.Tools.ARM64" if abi == "arm64"
+                     else "Microsoft.VisualStudio.Component.VC.Tools.x86.x64")
+        statuses.append(ToolStatus(f"MSVC[{abi}](VS Build Tools)", ok, str(msvc.install) if ok else "",
+                                   f"winget install {VS_BUILDTOOLS_WINGET} 或 {VS_BUILDTOOLS_URL}；"
+                                   f"需要组件 {component}"))
+    statuses += [
         ToolStatus("cmake", bool(which("cmake", env)), which("cmake", env) or "", "winget install Kitware.CMake"),
         ToolStatus("perl(原生Windows)", bool(detect_native_perl()), detect_native_perl() or "",
                    "python build.py bootstrap --platform windows --install（便携版 Strawberry Perl）"),
-        ToolStatus("nasm", bool(which("nasm", env)), which("nasm", env) or "", "winget install NASM.NASM"),
+        # nasm 只有 x86/x64 的汇编要用；只编 arm64 时不阻断
+        ToolStatus("nasm", bool(which("nasm", env)), which("nasm", env) or "", "winget install NASM.NASM",
+                   optional=not any(WINDOWS_ABI[a]["nasm"] for a in abis)),
         ToolStatus("GNU make(MSYS2)", bool(which("make", env) or bash), which("make", env) or bash,
                    "MSYS2: pacman -S make perl nasm"),
     ]
+    if "arm64" in abis:
+        gas = which("gas-preprocessor.pl", env) or ""
+        statuses.append(ToolStatus("gas-preprocessor.pl", bool(gas), gas,
+                                   "arm64 汇编需要（放进 PATH）；缺失时 ffmpeg --disable-asm、openh264 USE_ASM=No",
+                                   optional=True))
+    return statuses
 
 
 def _check_android(ctx) -> List[ToolStatus]:
@@ -103,9 +121,22 @@ def _check_android(ctx) -> List[ToolStatus]:
     return [
         ToolStatus("Android NDK", bool(ndk), str(ndk) if ndk else "",
                    "设置 ANDROID_NDK_HOME 或 bootstrap --platform android --install"),
-        ToolStatus("cmake", bool(which("cmake")), which("cmake") or "", "brew install cmake"),
-        ToolStatus("make", bool(which("make")), which("make") or "", "brew install make"),
+        ToolStatus("cmake", bool(which("cmake")), which("cmake") or "", _host_install_hint("cmake")),
+        ToolStatus("make", bool(which("make")), which("make") or "", _host_install_hint("make")),
+        # openssl 的 Configure 是 perl 脚本；ffmpeg 的 configure 靠 pkg-config 找
+        # openssl / srt / fdk-aac / openh264 —— 缺了要拖到编译中途才暴露
+        ToolStatus("perl", bool(which("perl")), which("perl") or "", _host_install_hint("perl")),
+        ToolStatus("pkg-config", bool(which("pkg-config")), which("pkg-config") or "",
+                   _host_install_hint("pkg-config")),
     ]
+
+
+def _host_install_hint(tool: str) -> str:
+    """交叉编译宿主（macOS / Linux）上装工具的命令。"""
+    if pl.system() == "Darwin":
+        return f"brew install {tool}"
+    package = {"pkg-config": "pkgconf-pkg-config"}.get(tool, tool)
+    return f"apt install -y {tool} / dnf install -y {package}"
 
 
 def _check_ohos(ctx) -> List[ToolStatus]:
@@ -166,14 +197,19 @@ def _check_linux() -> List[ToolStatus]:
     ]
 
 
-def _check_ios() -> List[ToolStatus]:
+def _check_ios(abis: Optional[List[str]] = None) -> List[ToolStatus]:
     on_mac = pl.system() == "Darwin"
     xcode = _run(["xcode-select", "-p"]) if on_mac else ""
+    abis = abis or ["arm64", "x86_64"]
+    # nasm 只给 x86_64 模拟器的 openh264 汇编用；只编 arm64 真机时不该阻断
+    # （与 IOSToolchain.prepare 的判断保持一致）
+    need_nasm = "x86_64" in abis
     return [
         ToolStatus("macOS", on_mac, pl.system(), "iOS 只能在 macOS 上交叉编译"),
         ToolStatus("Xcode", bool(xcode), xcode, "xcode-select --install"),
         ToolStatus("cmake", bool(which("cmake")), which("cmake") or "", "brew install cmake"),
-        ToolStatus("nasm", bool(which("nasm")), which("nasm") or "", "brew install nasm"),
+        ToolStatus("nasm", bool(which("nasm")), which("nasm") or "",
+                   "brew install nasm（x86_64 模拟器的 openh264 需要）", optional=not need_nasm),
         # ffmpeg 的 configure 靠 pkg-config 找 openssl / srt / fdk-aac / openh264，
         # 缺了不会在自检阶段暴露，而是拖到 configure 才报 "xxx not found using pkg-config"
         ToolStatus("pkg-config", bool(which("pkg-config")), which("pkg-config") or "", "brew install pkg-config"),
@@ -198,11 +234,17 @@ def install(platform: str, result: CheckResult, logger: Logger, runner: CommandR
     actions: List[str] = []
     tools = tools_root()
     tools.mkdir(parents=True, exist_ok=True)
+    msvc_done = False
     for status in result.missing:
         if platform == "windows":
+            if status.name.startswith("MSVC"):
+                # 多个 ABI 缺 MSVC 时只装一次（组件一次性带齐）
+                if msvc_done:
+                    continue
+                msvc_done = True
             actions += _install_windows(status, logger, runner, tools)
         elif platform == "android":
-            actions += _install_android(status, logger, tools)
+            actions += _install_android(status, logger, runner, tools)
         elif platform == "ohos":
             actions += _install_ohos(status)
         elif platform == "linux":
@@ -230,31 +272,40 @@ def _install_windows(status: ToolStatus, logger: Logger, runner: CommandRunner, 
 
 
 def _install_msvc(logger: Logger, runner: CommandRunner, tools: Path) -> List[str]:
+    # x86/x64 与 ARM64 两套编译器组件一起装：--abi x86 / arm64 都不用再回来补
+    components = ("--add Microsoft.VisualStudio.Workload.VCTools "
+                  "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
+                  "--add Microsoft.VisualStudio.Component.VC.Tools.ARM64 ")
     if which("winget"):
         logger.step("尝试 winget 安装 VS Build Tools（可能需要管理员授权）")
         result = runner.run(["winget", "install", "--id", VS_BUILDTOOLS_WINGET, "--exact",
                              "--accept-source-agreements", "--accept-package-agreements",
                              "--disable-interactivity", "--override",
-                             "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools "
-                             "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
+                             "--wait --passive " + components +
                              "--add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"],
                             check=False, log_name="winget-vs")
         if result.returncode == 0:
             return ["VS Build Tools 安装完成"]
     installer = download_file(VS_BUILDTOOLS_URL, tools / "vs_BuildTools.exe", logger)
     return [f"已下载安装器: {installer}",
-            f'管理员执行: "{installer}" --passive --wait --add Microsoft.VisualStudio.Workload.VCTools '
-            "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --includeRecommended"]
+            f'管理员执行: "{installer}" --passive --wait {components}--includeRecommended',
+            "已装 VS 但缺某个架构：VS Installer → 修改 → 单个组件，勾选对应的 MSVC 生成工具"]
 
 
-def _install_android(status: ToolStatus, logger: Logger, tools: Path) -> List[str]:
+def _install_android(status: ToolStatus, logger: Logger, runner: CommandRunner, tools: Path) -> List[str]:
     if status.name == "Android NDK":
         host = {"Darwin": "darwin", "Windows": "windows"}.get(pl.system(), "linux")
         zip_name = f"android-ndk-{NDK_VERSION}-{host}.zip"
         extract_archive(download_file(NDK_URL.format(version=NDK_VERSION, host=host), tools / zip_name, logger),
                         tools, logger)
         return [f"NDK -> {tools / f'android-ndk-{NDK_VERSION}'}"]
-    return [f"{status.name} 缺失：brew install {status.name}"]
+    if pl.system() == "Darwin" and which("brew"):
+        package = {"perl": "perl", "pkg-config": "pkg-config", "cmake": "cmake", "make": "make"}.get(status.name)
+        if package:
+            runner.run(["brew", "install", package], check=False, log_name=f"brew-{package}")
+            return [f"已执行 brew install {package}"]
+    # Linux 装包需要 root，只给命令不代装（与 linux 平台的 bootstrap 一致）
+    return [f"{status.name} 缺失：{status.hint}"]
 
 
 def _install_ohos(status: ToolStatus) -> List[str]:

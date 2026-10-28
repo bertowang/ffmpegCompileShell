@@ -26,7 +26,9 @@
 - [6. 环境要求与排错](#6-环境要求与排错)
   - [6.1 Windows CRT /MT](#61-windows-crt-必须一致mt)
 - [7. 与 MediaX 工程对接](#7-与-mediax-工程对接)
-  - [7.1 cuda-samples（NPP）：现状与建议](#71-cuda-samplesnpp现状与将来建议)
+  - [7.0 CMake 工程：`find_package(TGCapture3rd)`](#70-cmake-工程find_packagetgcapture3rd推荐)
+  - [7.1 拷贝到 `MediaX/ESMediaX/3rd`](#71-拷贝到-mediaxesmediax3rd)
+  - [7.2 cuda-samples（NPP）：现状与建议](#72-cuda-samplesnpp现状与将来建议)
 
 > ⚠️ **产物输出目录必须显式指定**（`-o/--output` 或环境变量 `FFMPEG_3RD_OUTPUT`），
 > 没有隐式默认值；漏给会直接报错退出，避免产物落到预期外的位置。详见第 2 节。
@@ -35,21 +37,30 @@
 
 | 平台 | 编译宿主 | ABI：默认 / `--abi all` | ffmpeg 形态 | 平台编码器（白名单追加） | 版本文件关键信息 | 一键脚本 |
 | - | - | - | - | - | - | - |
-| windows | Windows（MSVC + MSYS2） | `x64` / 不支持 `all`（见下方注意） | **动态**：`bin/*.dll` + `lib/*.lib`（import lib） | 默认无；开关后 `h264_nvenc` / `h264_amf` | `crtmt` / `crtmd` | `scripts/build_windows.ps1` |
+| windows | Windows（MSVC + MSYS2） | `x64` / `x64` `x86` `arm64` | **动态**：`bin/*.dll` + `lib/*.lib`（import lib） | 默认无；开关后 `h264_nvenc` / `h264_amf` | `crtmt` / `crtmd` | `scripts/build_windows.ps1` |
 | linux | **Linux 本机**（gcc/clang，不支持交叉编译） | 宿主架构 / 展开为 `x86_64` `arm64` `armhf`，但只有宿主架构能编出 | 静态 | 无 | 无 | 无 |
 | android | macOS / Linux（NDK） | `arm64-v8a` / `arm64-v8a` + `armeabi-v7a`（`x86_64` 需显式指定） | 静态 | `h264_mediacodec` | `api21` | `scripts/build_android.sh` |
 | ios | macOS（Xcode） | `arm64` + `x86_64` lipo 成 fat 库 / 同默认 | 静态 | `h264_videotoolbox` | `min12.0` | `scripts/build_ios.sh` |
 | ohos | Linux / macOS（OHOS SDK） | `arm64-v8a` / `arm64-v8a` `armeabi-v7a` `x86_64` | 静态（ffmpeg 用 openharmony-tpc fork） | 无 | 无 | 无 |
 
 > **注意：**
-> * **Windows 目前只能产出 x64。** `--abi x86` / `arm64` 能通过参数校验，但 MSVC 环境（vcvarsall x64）、
->   openssl target（`VC-WIN64A`）、ffmpeg（`--arch=x86_64`）、CMake 的 VS 生成器（`-A x64`）都写死了 x64，
->   产物仍是 x64 二进制，只是被放进 x86 / arm64 目录并按该 ABI 命名，**不可用**。要支持这两个架构需先改配方。
+> * **Windows 的三个 ABI 各用一套参数**：vcvarsall 目标（宿主 x64 上为 `x64` / `x64_x86` / `x64_arm64`）、
+>   CMake VS 生成器 `-A x64|Win32|ARM64`、openssl `VC-WIN64A|VC-WIN32|VC-WIN64-ARM`、
+>   ffmpeg `--arch=x86_64|x86|aarch64`、openh264 `ARCH=x86_64|x86|arm64`。
+>   自检会按 cl.exe 所在目录（`Host<宿主>\<目标>`）核对 MSVC 是否真的面向该架构，缺组件时直接报错并给出 VS 组件名
+>   （x86：`VC.Tools.x86.x64`，arm64：`VC.Tools.ARM64`），不会再编出“目录叫 x86、内容是 x64”的产物。
+>   arm64 在 x64 宿主上是交叉编译：ffmpeg 加 `--enable-cross-compile`，构建后的组件自检（要运行目标程序）跳过；
+>   ARM64 汇编需要 `gas-preprocessor.pl`（放进 PATH），没有时 ffmpeg `--disable-asm`、openh264 `USE_ASM=No`、openssl `no-asm`。
+>   实测（VS 2022 / MSVC 14.44，x64 宿主）：x64 全套可用；x86 的 zlib / openh264 / libyuv 已实编，
+>   经 `find_package` 链进 `-A Win32` 程序并运行通过，openssl / ffmpeg 的 x86 尚未实编；arm64 需先装 ARM64 组件，尚未实机验证。
 > * **Linux 只做本机编译**：只用宿主 gcc，ffmpeg 也不加 `--enable-cross-compile`。要 arm64 产物，就到 arm64 机器上编。
-> * `--abi` 多个值用**空格**分隔（`--abi arm64-v8a armeabi-v7a`），**不支持逗号**。
->   Windows 会把不认识的值悄悄丢掉并回落为 x64，其它平台则报“ABI 不支持”。
+> * `--abi` 多个值用**空格或逗号**分隔（`--abi x64 x86` / `--abi x64,x86`），支持 `all`（`*`）与平台别名，重复的自动去重。
+>   **不认识的值一律报错**并列出可选值（以前 Windows 会悄悄回落为 x64）。
+> * Windows 的 flat / lib 布局没有 abi 层：**同一个 `-o` 目录里先后单独编 x64、x86 会互相覆盖**。
+>   要多个 ABI 就一次编（`--abi x64,x86`，自动改用 `<库>/windows/<abi>` 布局），或给每个 ABI 不同的 `-o`。
 > * 平台名支持别名：`win`/`win64` → windows，`mac`/`iphoneos`/`darwin` → ios，
 >   `openharmony`/`harmonyos`/`harmony`/`oh` → ohos，`linux64`/`gnu-linux` → linux。
+> * 产物根目录自带 **CMake 包配置**（`find_package(TGCapture3rd)`），消费方怎么链接见[第 7 节](#7-与-mediax-工程对接)。
 
 ## 1. 依赖库清单
 
@@ -157,10 +168,15 @@ python build.py build --platform windows --deps D:/work/capture_deps.json ...   
 | 锁定文件 | `config/capture_deps.json` | `config/player_deps.json` |
 | 参与构建的库（`--libs all`） | 7 个：zlib / openssl / srt / fdk-aac / openh264 / libyuv / ffmpeg；可选 json / spdlog | 2 个：zlib / ffmpeg；可选 json / spdlog |
 | ffmpeg 外部库开关 | `--enable-zlib --enable-openssl --enable-libsrt --enable-libfdk-aac --enable-libopenh264`（**来自锁定文件 `ffmpeg_deps` 组的 `ffmpeg_flag`**，非硬编码）；开硬编时再追加 `--enable-ffnvcodec` / `--enable-d3d11va`（来自 `ffmpeg_hw_sdks` 组，见 1.4） | `--enable-zlib`（png 解码依赖 zlib） |
-| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台编码器：Android `h264_mediacodec`、iOS `h264_videotoolbox`、Windows 开开关后 `h264_nvenc`/`h264_amf`；Linux / OHOS 不追加）、封装 `flv,mpegts`、解封装含 `image2`（水印图）、协议 `file,tcp,tls,http,https,rtmp,rtmps,libsrt`（完整列表见第 5 节） | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,mp4,flv,mkv,mpegts,hls`、协议 `file,http,tcp,hls` |
+| 裁剪白名单（`config.PROFILE_WHITELIST`） | 编码器 `libopenh264,libfdk_aac,aac`（+ 平台编码器：Android `h264_mediacodec`、iOS `h264_videotoolbox`、Windows 开开关后 `h264_nvenc`/`h264_amf`；Linux / OHOS 不追加）、封装 `flv,mpegts`、解封装含 `image2`（水印图）、协议 `file,tcp,tls,http,https,rtmp,rtmps,libsrt`（完整列表见第 5 节） | **不生成** `--enable-encoder` / `--enable-muxer`；解码器 `h264,hevc,aac,mp3,png,mjpeg`、解封装 `mov,flv,matroska,mpegts,hls`（mp4/m4a 由 `mov`、mkv/webm 由 `matroska` 处理）、协议 `file,http,tcp,hls` |
 
-两个白名单细节（都是踩过坑才改的）：
+白名单细节（都是踩过坑才改的）：
 
+* 白名单写的是 **configure 的内部组件名**，不是文件扩展名：`mkv` → `matroska`、`mp4` → `mov`。
+  configure 对未知名称只打一行 WARNING 然后忽略，产物就悄悄缺组件。
+  现在 `build` 在 configure 之前会对照该 ffmpeg 源码的登记表（`libavcodec/allcodecs.c`、`libavformat/allformats.c`、
+  `protocols.c`、`parsers.c`、`bitstream_filters.c`、`libavfilter/allfilters.c`）逐个校验，名字不存在就直接报错；
+  登记表解析不出任何名字（换了大版本 / fork 格式不同）时只告警跳过，不误报。
 * 协议名要用 **`libsrt`**（协议内部名是 `libsrt`，URL scheme 才是 `srt`）；
   写成 `srt` 会被 configure **静默忽略**，结果 `ffmpeg -protocols` 里没有 `srt`，SRT 推流不可用。
 * **`--enable-zlib` 是 png 解码器的前提**：`png_decoder_select="inflate_wrapper"` → zlib，
@@ -465,7 +481,8 @@ python3 build.py build --platform android --abi all -o ~/TGCapture3rd   # arm64-
   也可只编一个：`--abi arm64`（别名 `device`）或 `--abi x86_64`（别名 `simulator`）。
 * 最低版本默认 `12.0`（`--min-version`），会写进版本文件名。
 * ffmpeg：静态库，`--disable-asm`（iOS 汇编需要 gas-preprocessor）+ `--enable-videotoolbox`。
-* `bootstrap --platform ios` 会**无条件要求 nasm**（即使只编 arm64）；`--install` 会用 brew 装上 cmake / nasm / pkg-config。
+* `bootstrap --platform ios` 只有目标 ABI 含 `x86_64`（模拟器的 openh264 汇编要用）时才要求 nasm；
+  只编真机（`--abi arm64`）时 nasm 是可选项。`--install` 会用 brew 装上 cmake / nasm / pkg-config。
 
 **Android**
 
@@ -473,8 +490,9 @@ python3 build.py build --platform android --abi all -o ~/TGCapture3rd   # arm64-
   要 `x86_64`（模拟器）需显式写上，例如 `--abi arm64-v8a armeabi-v7a x86_64`。
 * API 级别默认 `21`（`--api`）；NDK 按 `--ndk` / `ANDROID_NDK_HOME` 等路径查找，代码不校验 NDK 版本，推荐 r27c。
 * ffmpeg：静态库 + `--disable-symver`，并加 `--enable-jni --enable-mediacodec`（`h264_mediacodec` 硬编）。
-* `bootstrap --platform android` 只检查 NDK / cmake / make；`--install` 只会自动下载 NDK r27c。
-  openssl / ffmpeg 还需要 **perl 与 pkg-config**，bootstrap 不检查，请自备（`brew install pkg-config`）。
+* `bootstrap --platform android` 检查 NDK / cmake / make / **perl / pkg-config**（openssl 的 Configure 是 perl 脚本，
+  ffmpeg 的 configure 靠 pkg-config 找 openssl / srt / fdk-aac / openh264）。
+  `--install` 会自动下载 NDK r27c；macOS 上再用 brew 装缺的 perl / pkg-config / cmake / make，Linux 上只打印 apt / dnf 命令。
 
 一键脚本（都会先跑 `bootstrap --install`）：
 
@@ -537,7 +555,7 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 | 参数 | 说明 | 默认 |
 | - | - | - |
 | `-p/--platform` | `windows` / `linux` / `android` / `ios` / `ohos`（别名见第 0 节） | 必填 |
-| `--abi` | 多个值**空格分隔**。windows `x64`（`x86`/`arm64` 实际不可用，见第 0 节）；linux `x86_64`/`arm64`/`armhf`；android `arm64-v8a`/`armeabi-v7a`/`x86_64`；ios `arm64`/`x86_64`/`fat`；ohos `arm64-v8a`/`armeabi-v7a`/`x86_64`；`all` 的含义按平台不同（见第 0 节） | 平台默认（第 0 节） |
+| `--abi` | 多个值用**空格或逗号**分隔，不认识的值直接报错。windows `x64`/`x86`/`arm64`；linux `x86_64`/`arm64`/`armhf`；android `arm64-v8a`/`armeabi-v7a`/`x86_64`；ios `arm64`/`x86_64`/`fat`（别名 `device`/`simulator`）；ohos `arm64-v8a`/`armeabi-v7a`/`x86_64`；`all` 的含义按平台不同（见第 0 节）。`bootstrap` 也接受 `--abi`，按目标 ABI 自检 | 平台默认（第 0 节） |
 | `--libs` | 逗号分隔，`all` 为必须库全集（不含可选的 json / spdlog） | `all` |
 | `-o/--output` | 产物输出目录（`fetch` 不需要） | **必填**（或环境变量 `FFMPEG_3RD_OUTPUT`） |
 | `-j/--jobs` | 并行任务数 | CPU-1 |
@@ -554,7 +572,7 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 | 参数 | 说明 | 默认 |
 | - | - | - |
 | `--clean` | 编译前清理中间目录与旧产物 | 关 |
-| `--dry-run` | 只打印命令不执行 | 关 |
+| `--dry-run` | 只打印命令不执行（不落盘产物，也不写版本标记 / CMake 包配置） | 关 |
 | `--no-check` | 跳过构建前的工具链自检（自检只检查不安装） | 关 |
 | `--ffmpeg-ref` | 覆盖锁定文件里 ffmpeg 的 `ref`。锁定文件同时锁了 `commit` 时按 commit 拉取，**此参数不生效**；目前只对未锁 commit 的 OHOS fork 有效。换 ffmpeg 版本请改锁定文件 | 锁定文件 |
 | `--enable-nvenc` | Windows 启用 `h264_nvenc`；`nv-codec-headers` 按锁定文件自动拉取（详见 1.4） | 关 |
@@ -562,6 +580,7 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 | `--lto` | ffmpeg 开启 LTO（MSVC 下易踩坑） | 关 |
 
 其它：`clean --all` 同时删除输出目录里对应的产物；`bootstrap --install` 自动补齐工具（各平台能力见第 6 节）；
+`export -o <产物根目录>` 重新生成 CMake 包配置（`build` 结束时会自动生成，见第 7 节）；
 全局 `-q/--quiet` 减少输出。
 
 ## 4. 目录结构（脚本入库，源码/产物不入库）
@@ -577,7 +596,8 @@ FfmpegCompileShell/
 │   ├── toolchains.py        Windows(MSVC) / Linux(gcc/clang) / Android(NDK) / iOS(Xcode) / OHOS(OpenHarmony SDK)
 │   ├── recipes.py           各库编译配方（一库一函数）+ 硬编 SDK 的拉取与头文件落位
 │   ├── bootstrap.py         工具链自检与自动补齐
-│   └── cli.py               list / bootstrap / fetch / build / clean
+│   ├── cmake/               TGCapture3rdConfig.cmake（CMake 包配置模板，build / export 时写到产物根目录）
+│   └── cli.py               list / bootstrap / fetch / build / clean / export
 ├── scripts/                 一键入口：build_windows.ps1 / build_android.sh / build_ios.sh（Linux、OHOS 没有）
 └── tests/                   冒烟测试（python -m unittest discover -s tests -t .）
 ```
@@ -604,14 +624,13 @@ capture（开播）实际 enable 的组件：
 | encoder | `libopenh264,libfdk_aac,aac` + 平台编码器（Android `h264_mediacodec`、iOS `h264_videotoolbox`、Windows 开开关后 `h264_nvenc` / `h264_amf`；Linux / OHOS 不追加） |
 | decoder | `h264,aac,png` |
 | muxer | `flv,mpegts` |
-| demuxer | `mov,flv,mp4,image2,image_png_pipe`（`image2` / `image_png_pipe` 用来加载水印 PNG） |
+| demuxer | `mov,flv,image2,image_png_pipe`（`mov` 同时处理 mp4/m4a；`image2` / `image_png_pipe` 用来加载水印 PNG） |
 | parser | `h264,aac` |
 | bsf | `h264_mp4toannexb,aac_adtstoasc,null`，另自动并入 `extract_extradata` |
 | filter | `CAPTURE_FILTERS`，共 85 个（缩放、格式转换、叠加、裁剪、帧率、混音、响度等）；GPL-only 的滤镜（如 `eq` / `delogo` / `boxblur` / `perspective`）不含 |
 | protocol | `file,tcp,tls,http,https,rtmp,rtmps,libsrt` |
 
-> 白名单里的 `mp4`（以及 player 的 `mkv`）不是 ffmpeg 的 demuxer 名：MP4 由 `mov` 解封装，MKV 的 demuxer 叫 `matroska`。
-> capture 已有 `mov`，不受影响；player 若要播 MKV，需把 `mkv` 改成 `matroska`。
+> 所有名字在 configure 前都会对照 ffmpeg 源码的登记表校验（见 1.2），写错名字会直接报错。
 
 其余开关：
 
@@ -646,10 +665,10 @@ capture（开播）实际 enable 的组件：
 
 | 平台 | 编译主机 | 工具链 | `bootstrap --install` 能做什么 |
 | - | - | - | - |
-| windows | Windows | VS 2022 Build Tools（MSVC）+ MSYS2（make/install/perl/nasm）+ cmake/ninja | winget 装 VS Build Tools（失败则下载安装器并打印命令）；Strawberry Perl / nasm / cmake 便携版下到 `tools/`；make 需自装 MSYS2 |
+| windows | Windows | VS 2022 Build Tools（MSVC；x86 / arm64 各需对应组件）+ MSYS2（make/install/perl/nasm）+ cmake/ninja；arm64 汇编另需 gas-preprocessor.pl（可选） | winget 装 VS Build Tools（含 x86/x64 与 ARM64 组件，失败则下载安装器并打印命令）；Strawberry Perl / nasm / cmake 便携版下到 `tools/`；make 需自装 MSYS2 |
 | linux | Linux | gcc/clang + GNU make + cmake + pkg-config + perl（nasm 可选，缺则关 x86 汇编） | 只打印 dnf / apt 安装命令 |
-| android | macOS / Linux | Android NDK（推荐 r27c，不校验版本）+ cmake + make + perl + pkg-config | 只自动下载 NDK r27c；其它缺项只提示（perl / pkg-config 不检查） |
-| ios | macOS | Xcode 命令行工具 + cmake + nasm + pkg-config（ffmpeg configure 找 openssl/srt/fdk-aac/openh264 用） | `xcode-select --install` + brew 装 cmake / nasm / pkg-config |
+| android | macOS / Linux | Android NDK（推荐 r27c，不校验版本）+ cmake + make + perl + pkg-config | 自动下载 NDK r27c；macOS 上 brew 装 perl / pkg-config / cmake / make，Linux 上只打印 apt / dnf 命令 |
+| ios | macOS | Xcode 命令行工具 + cmake + pkg-config（ffmpeg configure 找 openssl/srt/fdk-aac/openh264 用）；nasm 只在编 `x86_64` 模拟器时需要 | `xcode-select --install` + brew 装 cmake / nasm / pkg-config |
 | ohos | Linux / macOS | DevEco Studio 或 commandline-tools 的 OHOS SDK（`$OHOS_SDK`）+ cmake + make + perl | 只给出指引 |
 
 OHOS SDK 无法自动下载（需 DevEco Studio / commandline-tools），`bootstrap --platform ohos` 只做检测并给出指引。
@@ -665,7 +684,7 @@ OHOS SDK 无法自动下载（需 DevEco Studio / commandline-tools），`bootst
 * **`xxx not found using pkg-config`** → 脚本已处理（shell 内 export `PKG_CONFIG_PATH`、
   `.pc` 的 prefix 改写、openssl/srt 的库名与 .pc 归一化）。
   若报的是 **命令本身不存在**（macOS 默认没有 `pkg-config`），先 `brew install pkg-config`
-  再重跑；`bootstrap --platform ios --install` 会自动装（Android 的 bootstrap 不检查 pkg-config，需自己装）。
+  再重跑；`bootstrap --platform ios|android --install` 会自动装（Android 在 Linux 宿主上只打印 apt / dnf 命令）。
 * **ffmpeg 装到了奇怪目录** → 脚本已处理（Windows 路径转 `/d/...` 传给 bash）。
 * **`amfenc.h(22): fatal error C1083: 无法打开包括文件 "AMF/core/Factory.h"`** →
   Windows 下 `-I` 必须写成 `D:/...` 正斜杠：`make` 经 MSYS bash 执行，配方里的
@@ -722,6 +741,42 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 ## 7. 与 MediaX 工程对接
 
+### 7.0 CMake 工程：`find_package(TGCapture3rd)`（推荐）
+
+产物根目录（`-o` 指定的目录）本身就是一个 **CMake 包前缀**。每次 `build` 结束都会在根目录写出
+`TGCapture3rdConfig.cmake` + `TGCapture3rdConfigVersion.cmake`；旧产物没有的话可以补一份：
+`python build.py export -o <产物根目录>`。消费方按 CMake 的标准用法接入，不需要手写 include/lib 目录和链接顺序：
+
+```cmake
+# cmake -DCMAKE_PREFIX_PATH=<产物根目录> ...   （或 -DTGCapture3rd_DIR=<产物根目录>）
+find_package(TGCapture3rd 1 CONFIG REQUIRED COMPONENTS ffmpeg libyuv)
+target_link_libraries(app PRIVATE TGCapture3rd::avformat TGCapture3rd::avcodec TGCapture3rd::libyuv)
+
+# Windows：把 ffmpeg 的 DLL 拷到 exe 旁（CMake ≥ 3.21）
+add_custom_command(TARGET app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:app> $<TARGET_FILE_DIR:app>
+    COMMAND_EXPAND_LISTS)
+```
+
+| 组件 | 导入目标 | 说明 |
+| - | - | - |
+| `ffmpeg` | `TGCapture3rd::avformat` / `avcodec` / `avfilter` / `swscale` / `swresample` / `avutil`，汇总目标 `TGCapture3rd::ffmpeg` | Windows 为 `SHARED IMPORTED`（`.lib` + DLL）；其它平台为静态库，openssl / srt / fdk-aac / openh264 / zlib 与系统库按 ffmpeg 自己的 `.pc` 自动传递（`.pc` 里旧的绝对 `-L` 路径会被忽略，产物整体挪位置也能用） |
+| `openssl` | `TGCapture3rd::ssl` / `TGCapture3rd::crypto`，汇总 `TGCapture3rd::openssl` | 静态库，Windows 自带 ws2_32 / crypt32 等系统库 |
+| `zlib` `srt` `fdk-aac` `openh264` `libyuv` `spdlog` `json` | `TGCapture3rd::<组件名>` | 静态库；`spdlog` 带 `SPDLOG_COMPILED_LIB`，`json` 为 header-only |
+
+* **平台 / ABI 自动推断**：Windows 按编译器目标架构（`-A x64|Win32|ARM64`），Android 按 `ANDROID_ABI`，
+  OHOS 按 `OHOS_ARCH`，Linux 按 `CMAKE_SYSTEM_PROCESSOR`，iOS 用 fat 库；也可以用 `-DTGCapture3rd_PLATFORM=` / `-DTGCapture3rd_ABI=` 指定。
+* **架构核对**：Windows 的 flat 布局没有 abi 层，包配置会读版本标记里的 `platform : windows (x64)` 核对，
+  比如 `-A Win32` 却指向 x64 产物时，在 configure 阶段就报错，而不是到链接时才报 `LNK1112`。
+* **交叉编译**：Android / OHOS 工具链把包查找限定在 sysroot（`CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY`），
+  `find_package` 要加 `NO_CMAKE_FIND_ROOT_PATH`，或直接给 `-DTGCapture3rd_DIR=<产物根目录>`。
+* 输出变量：`TGCapture3rd_<组件>_FOUND` / `_VERSION` / `_PREFIX`、`TGCapture3rd_PROFILE`（来自 `.build_profile`）、
+  `TGCapture3rd_RUNTIME_DLLS`（Windows ffmpeg DLL 列表）。在 `add_subdirectory` 引入的子工程里查找、
+  上层也要用这些目标时，设 `TGCapture3rd_IMPORT_GLOBAL=ON`（或 CMake 3.24+ 的 `CMAKE_FIND_PACKAGE_TARGETS_GLOBAL`）。
+* 包版本 `1.x`（导入目标命名与组件划分的接口版本，与各库版本无关），主版本不同视为不兼容。
+* 用法示例见 `RefactorMediaX/cmake/Deps.cmake`。
+
+### 7.1 拷贝到 `MediaX/ESMediaX/3rd`
 > 说明：`MediaX/ESMediaX/3rd` 原有的构建脚本（`build_ffmpeg.py`、`build_fdkaac.py`、`build_openh264.py`、
 > `build_spdlog.py`、`public.py`、`ohos_envset.sh`）已并入本工程并删除，该仓库现在只存放预编译产物。
 
@@ -744,7 +799,7 @@ Windows 的 ffmpeg 同时提供 `lib/*.lib`（import lib）与 `bin/*.dll`。
   （拿不到硬编时仍走软编回退）。运行期不需要随包任何 SDK 文件（编解码由显卡驱动提供），
   因此**不要**把 `amf/` 或 `nv-codec-headers/` 拷进 `3rd`（详见 1.4）。
 
-### 7.1 cuda-samples（NPP）：现状与将来建议
+### 7.2 cuda-samples（NPP）：现状与将来建议
 
 本工程**不构建** cuda-samples，也不产出任何 CUDA/NPP 相关内容；以下只是给 MediaX 侧的处置建议，
 **当前保持不变**。

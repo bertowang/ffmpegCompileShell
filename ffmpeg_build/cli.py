@@ -1,4 +1,4 @@
-"""命令行入口：list / bootstrap / fetch / build / clean。"""
+"""命令行入口：list / bootstrap / fetch / build / clean / export。"""
 
 from __future__ import annotations
 
@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_boot = sub.add_parser("bootstrap", help="检查并补齐编译工具链")
     p_boot.add_argument("-p", "--platform", required=True, help=PLATFORM_HELP)
+    # 自检按目标 ABI 进行：Windows 每个 ABI 单独核对 MSVC 组件，iOS 只编 arm64 时不要求 nasm
+    p_boot.add_argument("--abi", nargs="*", default=None, help=ABI_HELP)
     p_boot.add_argument("--install", action="store_true", help="自动下载/安装缺失工具")
     _deps_args(p_boot)
     p_boot.set_defaults(func=cmd_bootstrap)
@@ -78,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
     _common(p_clean, require_output=True)
     p_clean.add_argument("--all", action="store_true", help="同时删除 TGCapture3rd 中对应库")
     p_clean.set_defaults(func=cmd_clean)
+
+    p_export = sub.add_parser("export", help="在产物根目录生成 CMake 包配置（find_package(TGCapture3rd)）")
+    p_export.add_argument("-o", "--output", default=None,
+                          help=f"产物根目录（必填；也可设环境变量 {ENV_OUTPUT}）")
+    p_export.set_defaults(func=cmd_export)
     return parser
 
 
@@ -210,6 +217,11 @@ def cmd_build(args, logger: Logger) -> int:
             logger.step(f"{name} [{abi}] 开始编译")
             stages[abi] = REGISTRY[name](ctx, abi)
             logger.info(f"{name} [{abi}] 完成 ({time.time() - started:.1f}s)")
+        if ctx.dry_run:
+            # dry-run 不落盘：finalize 会建出空的 <abi>/lib、版本标记会写进产物目录，
+            # 混进真实产物后 find_package(TGCapture3rd) 会挑中这些空目录
+            results[name] = ctx.toolchain.install_dir(name, ctx.abis[0] if ctx.abis else None)
+            continue
         output = ctx.toolchain.finalize(name, stages)
         results[name] = output
         _write_manifest(ctx, name, output)
@@ -217,6 +229,8 @@ def cmd_build(args, logger: Logger) -> int:
     logger.section("产物汇总")
     for name, output in results.items():
         logger.info(f"{name:<10} -> {output}")
+        if not output.is_dir():
+            continue
         if is_portable(name):       # header-only：没有 lib，列出顶层目录即可
             for item in sorted(p.name for p in output.iterdir() if p.is_dir()):
                 logger.info(f"{'':<14}{item}/")
@@ -229,6 +243,8 @@ def cmd_build(args, logger: Logger) -> int:
             for item in static_lib_names(sub):
                 logger.info(f"{'':<14}lib/{sub.name}/{item}")
     logger.info(f"全部完成，共 {len(results)} 个库")
+    if not ctx.dry_run:
+        export_cmake_package(ctx.output_root, logger)
     return 0
 
 
@@ -237,6 +253,70 @@ def cmd_clean(args, logger: Logger) -> int:
     _clean(ctx, _ordered(args.libs), output_too=args.all)
     logger.info("清理完成")
     return 0
+
+
+def cmd_export(args, logger: Logger) -> int:
+    root = resolve_output_root(args.output, required=True)
+    if not root.is_dir():
+        raise RuntimeError(f"产物根目录不存在：{root}")
+    export_cmake_package(root, logger)
+    return 0
+
+
+# ------------------------------------------------------------------ CMake 包
+CMAKE_PACKAGE_NAME = "TGCapture3rd"
+# 包配置的接口版本（导入目标命名 / 组件划分），与各库版本无关；不兼容改动时升主版本
+CMAKE_PACKAGE_VERSION = "1.0.0"
+CMAKE_TEMPLATE_DIR = Path(__file__).resolve().parent / "cmake"
+
+_CONFIG_VERSION_TEMPLATE = """\
+# {name}ConfigVersion.cmake —— 由 FfmpegCompileShell 生成，请勿手改。
+# 兼容规则：主版本相同、且不低于请求的版本（等价于 SameMajorVersion）。
+# 不在这里按指针大小过滤：同一产物根目录可同时放多个 ABI，由 {name}Config.cmake 按目标 ABI 选择。
+set(PACKAGE_VERSION "{version}")
+if(PACKAGE_FIND_VERSION_RANGE)
+    if((PACKAGE_FIND_VERSION_RANGE_MIN STREQUAL "INCLUDE" AND PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION_MIN)
+       OR (PACKAGE_FIND_VERSION_RANGE_MIN STREQUAL "EXCLUDE" AND PACKAGE_VERSION VERSION_LESS_EQUAL PACKAGE_FIND_VERSION_MIN)
+       OR (PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "INCLUDE" AND PACKAGE_VERSION VERSION_GREATER PACKAGE_FIND_VERSION_MAX)
+       OR (PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "EXCLUDE" AND PACKAGE_VERSION VERSION_GREATER_EQUAL PACKAGE_FIND_VERSION_MAX))
+        set(PACKAGE_VERSION_COMPATIBLE FALSE)
+    else()
+        set(PACKAGE_VERSION_COMPATIBLE TRUE)
+    endif()
+elseif(PACKAGE_FIND_VERSION)
+    if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION OR NOT PACKAGE_FIND_VERSION_MAJOR STREQUAL "{major}")
+        set(PACKAGE_VERSION_COMPATIBLE FALSE)
+    else()
+        set(PACKAGE_VERSION_COMPATIBLE TRUE)
+        if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)
+            set(PACKAGE_VERSION_EXACT TRUE)
+        endif()
+    endif()
+else()
+    set(PACKAGE_VERSION_COMPATIBLE TRUE)
+endif()
+"""
+
+
+def export_cmake_package(root: Path, logger: Logger) -> List[Path]:
+    """把 <name>Config.cmake / <name>ConfigVersion.cmake 写到产物根目录。
+
+    产物根目录即 CMake 包前缀：消费方 -DCMAKE_PREFIX_PATH=<根> 或 -D<name>_DIR=<根> 后
+    find_package(<name> CONFIG COMPONENTS ...) 即可得到 <name>::xxx 导入目标。
+    """
+    template = CMAKE_TEMPLATE_DIR / f"{CMAKE_PACKAGE_NAME}Config.cmake"
+    if not template.is_file():
+        raise RuntimeError(f"缺少 CMake 包模板：{template}")
+    root.mkdir(parents=True, exist_ok=True)
+    config = root / template.name
+    version = root / f"{CMAKE_PACKAGE_NAME}ConfigVersion.cmake"
+    config.write_bytes(template.read_bytes())
+    version.write_text(_CONFIG_VERSION_TEMPLATE.format(
+        name=CMAKE_PACKAGE_NAME, version=CMAKE_PACKAGE_VERSION,
+        major=CMAKE_PACKAGE_VERSION.split(".")[0]), encoding="utf-8")
+    logger.info(f"CMake 包配置 -> {config}（find_package({CMAKE_PACKAGE_NAME} CONFIG)，"
+                f"-DCMAKE_PREFIX_PATH={root}）")
+    return [config, version]
 
 
 # ------------------------------------------------------------------ 辅助
