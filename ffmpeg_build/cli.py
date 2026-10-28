@@ -21,9 +21,9 @@ from .utils import (CommandRunner, Logger, build_marker_name, git_head_sha,
                     static_lib_names, write_version_file)
 
 PLATFORM_HELP = ("目标平台: windows(本机 MSVC) / linux(本机 gcc) / android(交叉编译) / "
-                 "ios(mac 编译) / ohos(OpenHarmony，需 OHOS SDK，Linux/macOS 宿主)")
+                 "ios(mac 编译) / macos(本机 Mac，跑单测/命令行) / ohos(OpenHarmony，需 OHOS SDK，Linux/macOS 宿主)")
 ABI_HELP = ("windows: x64/x86/arm64; linux: x86_64/arm64/armhf(默认取宿主架构); "
-            "android: arm64-v8a/armeabi-v7a/x86_64; ios: arm64/x86_64/fat; "
+            "android: arm64-v8a/armeabi-v7a/x86_64; ios: arm64/x86_64/fat; macos: arm64/x86_64(默认取宿主); "
             "ohos: arm64-v8a/armeabi-v7a/x86_64")
 
 
@@ -99,7 +99,7 @@ def _common(parser: argparse.ArgumentParser, require_output: bool = True) -> Non
     parser.add_argument("--ndk", default=None, help="Android NDK 路径")
     parser.add_argument("--api", type=int, default=21, help="Android API，默认 21")
     parser.add_argument("--ohos-sdk", default=None, help="OHOS SDK 根目录（含 native/），默认取 $OHOS_SDK")
-    parser.add_argument("--min-version", default="12.0", help="iOS 最低版本，默认 12.0")
+    parser.add_argument("--min-version", default="12.0", help="iOS 最低版本，默认 12.0（macos 平台：-mmacosx-version-min，默认 11.0）")
     parser.add_argument("--force-fetch", action="store_true", help="强制重新拉取源码")
     parser.add_argument("--crt", default=None, choices=list(CRT_OPTIONS),
                         help=f"Windows 运行时库：mt=/MT 静态（默认，与现有产物一致）；md=/MD 动态（给 /MD 的消费方）。"

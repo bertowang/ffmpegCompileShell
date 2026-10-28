@@ -52,6 +52,8 @@ OHOS_LAYOUT: Dict[str, str] = {"spdlog": "flat"}
 IOS_LAYOUT: Dict[str, str] = {}
 # Linux：没有 3rd-bak 的历史包袱，统一 <库>/linux/<abi>/{include,lib,bin}
 LINUX_LAYOUT: Dict[str, str] = {}
+# macOS（本机）：同 Linux，<库>/macos/<abi>/{include,lib}
+MACOS_LAYOUT: Dict[str, str] = {}
 
 PLATFORM_LAYOUT: Dict[str, Dict[str, str]] = {
     "windows": WINDOWS_LAYOUT,
@@ -59,9 +61,10 @@ PLATFORM_LAYOUT: Dict[str, Dict[str, str]] = {
     "ohos": OHOS_LAYOUT,
     "ios": IOS_LAYOUT,
     "linux": LINUX_LAYOUT,
+    "macos": MACOS_LAYOUT,
 }
 DEFAULT_PLATFORM_LAYOUT: Dict[str, str] = {
-    "windows": "abi", "android": "abi", "ohos": "abi", "ios": "flat", "linux": "abi",
+    "windows": "abi", "android": "abi", "ohos": "abi", "ios": "flat", "linux": "abi", "macos": "abi",
 }
 DEFAULT_WINDOWS_LAYOUT = DEFAULT_PLATFORM_LAYOUT["windows"]
 
@@ -247,7 +250,8 @@ CAPTURE_WHITELIST: Dict[str, object] = {
     "description": "开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)，其余组件全部裁掉",
     # 开播 = 采集 → 编码 → 封装(flv/mpegts) → 推流(rtmp/rtmps/srt)
     "encoders": ["libopenh264", "libfdk_aac", "aac"],
-    "platform_encoders": {"windows": [], "android": ["h264_mediacodec"], "ios": ["h264_videotoolbox"]},
+    "platform_encoders": {"windows": [], "android": ["h264_mediacodec"], "ios": ["h264_videotoolbox"],
+                          "macos": ["h264_videotoolbox"]},
     "decoders": ["h264", "aac", "png"],
     "muxers": ["flv", "mpegts"],
     # image2 / image_png_pipe：水印 logo 之类的 png 图片要经 avformat 打开；

@@ -915,9 +915,90 @@ class LinuxToolchain(Toolchain):
                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
 
 
+# ------------------------------------------------------------------ macOS
+# 本机 macOS 构建（Xcode clang + make）：用于在 Mac 上直接跑内核单测 / 命令行 demo
+# （产物能在宿主执行，比走 iOS 模拟器或 Android 模拟器快一个数量级）。
+# 与 Linux 一样是 abi 目录布局：<库>/macos/<abi>/{include,lib}，不做 lipo 合并。
+MACOS_ABI = {
+    "arm64": {"arch": "arm64", "openssl": "darwin64-arm64-cc", "openh264": "arm64"},
+    "x86_64": {"arch": "x86_64", "openssl": "darwin64-x86_64-cc", "openh264": "x86_64"},
+}
+MACOS_HOST_ARCH = {"arm64": "arm64", "x86_64": "x86_64"}
+
+
+class MacOSToolchain(Toolchain):
+    name = "macos"
+    default_abis = [MACOS_HOST_ARCH.get(platform_mod.machine(), "arm64")]
+    supported_abis = list(MACOS_ABI)
+    use_abi_dir = True
+    default_macos_min = "11.0"
+
+    def __init__(self, ctx, min_version: str = ""):
+        super().__init__(ctx)
+        self.min_version = min_version or self.default_macos_min
+        self.compiler_id = "clang"
+        self.nasm = which("nasm") or ""
+        self._sdk = ""
+
+    def prepare(self) -> None:
+        if platform_mod.system() != "Darwin":
+            raise ToolchainError("macOS", f"macOS 产物需在 Mac 上构建（当前宿主 {platform_mod.system()}）")
+        self._sdk = self._xcrun(["xcrun", "--sdk", "macosx", "--show-sdk-path"])
+        if not self._sdk:
+            raise ToolchainError("macOS SDK", "xcrun 找不到 macosx SDK", "xcode-select --install 或安装完整版 Xcode")
+        for tool, hint in (("make", "openssl/openh264/ffmpeg 需要 make"),
+                           ("cmake", "srt/fdk-aac/zlib/libyuv 用 CMake 构建"),
+                           ("pkg-config", "ffmpeg 的 configure 靠它找 openssl/srt/fdk-aac/openh264"),
+                           ("perl", "openssl 的 Configure 需要 perl")):
+            if not which(tool):
+                raise ToolchainError(tool, f"未找到 {tool}（{hint}）", f"brew install {tool}")
+        if "x86_64" in self.ctx.abis and not self.nasm:
+            self.logger.warn("未找到 nasm：x86_64 的 ffmpeg / openh264 将关闭汇编（编码性能略降）")
+        self.logger.info(f"macOS 工具链就绪: SDK={self._sdk} min={self.min_version} nasm={self.nasm or '-'}")
+
+    @staticmethod
+    def _xcrun(cmd: List[str]) -> str:
+        import subprocess
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+        except Exception:      # noqa: BLE001 —— 由 prepare() 统一报错
+            return ""
+
+    @property
+    def sdk_path(self) -> str:
+        if not self._sdk:
+            self._sdk = self._xcrun(["xcrun", "--sdk", "macosx", "--show-sdk-path"])
+        return self._sdk
+
+    @property
+    def marker_variant(self) -> str:
+        return f"min{self.min_version}"
+
+    def arch_flags(self, abi: str) -> str:
+        return f"-arch {MACOS_ABI[abi]['arch']} -mmacosx-version-min={self.min_version}"
+
+    def build_env(self, abi: str) -> Dict[str, str]:
+        env = os.environ.copy()
+        flags = f"{self.arch_flags(abi)} -isysroot {self.sdk_path} -fPIC -O3"
+        env.update({"CC": "clang", "CXX": "clang++", "CFLAGS": flags, "CXXFLAGS": flags,
+                    "LDFLAGS": self.arch_flags(abi), "SDKROOT": self.sdk_path,
+                    "MACOSX_DEPLOYMENT_TARGET": self.min_version})
+        return env
+
+    def cmake_args(self, abi: str) -> List[str]:
+        return ["-G", "Unix Makefiles", "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                f"-DCMAKE_OSX_ARCHITECTURES={MACOS_ABI[abi]['arch']}",
+                f"-DCMAKE_OSX_DEPLOYMENT_TARGET={self.min_version}",
+                f"-DCMAKE_SYSTEM_PROCESSOR={MACOS_ABI[abi]['arch']}"]
+
+
 TOOLCHAINS = {"windows": WindowsToolchain, "android": AndroidToolchain,
-              "ios": IOSToolchain, "ohos": OHOSToolchain, "linux": LinuxToolchain}
+              "ios": IOSToolchain, "ohos": OHOSToolchain, "linux": LinuxToolchain,
+              "macos": MacOSToolchain}
+# 注意 mac / darwin 历史上指向 ios，保留兼容；macOS 本机产物用 macos / osx / macosx
 PLATFORM_ALIASES = {"win": "windows", "win64": "windows", "mac": "ios", "iphoneos": "ios", "darwin": "ios",
+                    "osx": "macos", "macosx": "macos",
                     "openharmony": "ohos", "harmonyos": "ohos", "harmony": "ohos", "oh": "ohos",
                     "linux64": "linux", "gnu-linux": "linux"}
 
@@ -939,4 +1020,7 @@ def create_toolchain(name: str, ctx, **kwargs) -> Toolchain:
         return cls(ctx, sdk=kwargs.get("ohos_sdk"))
     if cls is LinuxToolchain:      # 本机编译，没有 SDK / 最低版本之类的平台参数
         return cls(ctx)
+    if cls is MacOSToolchain:      # --min-version 对 macOS 指 -mmacosx-version-min；iOS 的默认值 12.0 不适用
+        mv = kwargs.get("min_version")
+        return cls(ctx, min_version=mv if mv and mv != "12.0" else "")
     return cls(ctx, min_version=kwargs.get("min_version", "12.0"))

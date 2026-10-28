@@ -70,6 +70,9 @@ def check(platform: str, logger: Logger, ctx=None) -> CheckResult:
         result.statuses = _check_ohos(ctx)
     elif platform == "linux":
         result.statuses = _check_linux()
+    elif platform == "macos":
+        # 与 iOS 共用 Xcode / cmake / pkg-config 检查；nasm 只有 x86_64 需要
+        result.statuses = _check_ios([a for a in abis if a == "x86_64"] or ["arm64"])
     else:
         result.statuses = _check_ios(abis)
     return result

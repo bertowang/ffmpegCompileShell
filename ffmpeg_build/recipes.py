@@ -185,6 +185,10 @@ def build_openssl(ctx, abi: str) -> Path:
             target = LINUX_ABI[abi]["openssl"]
             configure = (f"./Configure {target} -fPIC {' '.join(OPENSSL_OPTIONS)} "
                          f"--prefix={stage} --openssldir={stage}/ssl")
+        elif platform == "macos":
+            from .toolchains import MACOS_ABI
+            configure = (f"./Configure {MACOS_ABI[abi]['openssl']} -mmacosx-version-min={toolchain.min_version} "
+                         f"{' '.join(OPENSSL_OPTIONS)} --prefix={stage} --openssldir={stage}/ssl")
         else:
             configure = (f"./Configure {IOS_OPENSSL_TARGETS.get(abi, 'ios64-xcrun')} "
                          f"{' '.join(OPENSSL_OPTIONS)} --prefix={stage} --openssldir={stage}/ssl")
@@ -303,6 +307,13 @@ def build_openh264(ctx, abi: str) -> Path:
         use_asm = "Yes" if getattr(toolchain, "nasm", "") else "No"
         script = (f"make -j{ctx.jobs} OS=linux ARCH={LINUX_ABI[abi]['openh264']} "
                   f"USE_ASM={use_asm} BUILDTYPE=Release install-static PREFIX={stage}")
+    elif platform == "macos":
+        from .toolchains import MACOS_ABI
+        # arm64 的 NEON 汇编用 clang 自带汇编器；x86_64 需要 nasm，没有就关
+        use_asm = "Yes" if abi == "arm64" or getattr(toolchain, "nasm", "") else "No"
+        script = (f"make -j{ctx.jobs} OS=darwin ARCH={MACOS_ABI[abi]['openh264']} "
+                  f"SDK_MIN={toolchain.min_version} USE_ASM={use_asm} BUILDTYPE=Release "
+                  f"install-static PREFIX={stage}")
     else:
         arch = abi.replace('-simulator', '')
         # 每个 ABI 已经是 _in_source_copy 隔离出的独立源码副本，不会再出现多 ABI
@@ -732,7 +743,7 @@ def _runs_on_host(ctx, abi: str) -> bool:
 # 都会静默发生，只有跑起来才暴露（如开播滤镜链找不到 volume/amix）。
 # 只在"产物能直接在宿主执行"的平台上跑（Windows / Linux 本机）；
 # 交叉编译产物（android/ios/ohos）在宿主上跑不起来，只能跳过。
-NATIVE_VERIFY_PLATFORMS = ("windows", "linux")
+NATIVE_VERIFY_PLATFORMS = ("windows", "linux", "macos")
 _COMPONENT_CHECKS = (("filters", "-filters"), ("decoders", "-decoders"),
                      ("encoders", "-encoders"), ("demuxers", "-demuxers"),
                      ("muxers", "-muxers"), ("protocols", "-protocols"),
@@ -1006,6 +1017,23 @@ def _ffmpeg_platform_args(ctx, abi) -> List[str]:
                 "--extra-libs='-lm -lpthread -ldl -lstdc++'"]
         if not getattr(ctx.toolchain, "nasm", ""):
             # ffmpeg 6.1 的 x86 汇编要求 nasm >= 2.13；没有就整体关掉而不是编到一半失败
+            args.append("--disable-x86asm")
+        return args
+
+    if ctx.platform == "macos":
+        from .toolchains import MACOS_ABI
+        toolchain = ctx.toolchain
+        flags = toolchain.arch_flags(abi)
+        args = [f"--arch={MACOS_ABI[abi]['arch']}", "--target-os=darwin",
+                "--cc=clang", "--cxx=clang++",
+                f"--sysroot='{toolchain.sdk_path}'",
+                "--enable-videotoolbox",
+                "--enable-static", "--disable-shared", "--disable-symver",
+                f"--extra-cflags='{flags} -ffunction-sections -fdata-sections'",
+                f"--extra-ldflags='{flags} -framework CoreFoundation -framework CoreVideo "
+                "-framework CoreMedia -framework VideoToolbox -framework Security'",
+                "--extra-libs='-lc++'"]
+        if abi == "x86_64" and not getattr(toolchain, "nasm", ""):
             args.append("--disable-x86asm")
         return args
 

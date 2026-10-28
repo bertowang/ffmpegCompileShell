@@ -10,7 +10,7 @@
 # 或直接给 -DTGCapture3rd_DIR=<产物根目录>。
 #
 # 可选输入（不设则按当前工具链自动推断）：
-#   TGCapture3rd_PLATFORM       windows | linux | android | ios | ohos
+#   TGCapture3rd_PLATFORM       windows | linux | macos | android | ios | ohos
 #   TGCapture3rd_ABI            windows: x64/x86/arm64；linux: x86_64/arm64/armhf；
 #                               android / ohos: arm64-v8a/armeabi-v7a/x86_64；ios 为 fat 库，不需要
 #   TGCapture3rd_IMPORT_GLOBAL  ON 时导入目标为 GLOBAL（本工程被 add_subdirectory 引入、上层也要看到这些目标时）
@@ -59,8 +59,10 @@ if(NOT TGCapture3rd_PLATFORM)
         set(TGCapture3rd_PLATFORM windows)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(TGCapture3rd_PLATFORM linux)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(TGCapture3rd_PLATFORM macos)
     else()
-        _tg3_fail("TGCapture3rd 不提供 ${CMAKE_SYSTEM_NAME} 平台的产物（支持 windows/linux/android/ios/ohos），可用 -DTGCapture3rd_PLATFORM= 指定")
+        _tg3_fail("TGCapture3rd 不提供 ${CMAKE_SYSTEM_NAME} 平台的产物（支持 windows/linux/macos/android/ios/ohos），可用 -DTGCapture3rd_PLATFORM= 指定")
     endif()
 endif()
 set(_tg3_plat "${TGCapture3rd_PLATFORM}")
@@ -111,6 +113,18 @@ if(NOT TGCapture3rd_ABI AND NOT _tg3_plat STREQUAL "ios")
         elseif(_tg3_proc MATCHES "^arm")
             set(TGCapture3rd_ABI armhf)
         endif()
+    elseif(_tg3_plat STREQUAL "macos")
+        # 优先看 CMAKE_OSX_ARCHITECTURES（只认单架构；通用二进制需要两份产物，不在这里拼）
+        set(_tg3_proc "${CMAKE_OSX_ARCHITECTURES}")
+        if(NOT _tg3_proc)
+            set(_tg3_proc "${CMAKE_SYSTEM_PROCESSOR}")
+        endif()
+        string(TOLOWER "${_tg3_proc}" _tg3_proc)
+        if(_tg3_proc MATCHES "^(x86_64|amd64)$")
+            set(TGCapture3rd_ABI x86_64)
+        elseif(_tg3_proc MATCHES "^(arm64|aarch64)$")
+            set(TGCapture3rd_ABI arm64)
+        endif()
     endif()
     if(NOT TGCapture3rd_ABI)
         _tg3_fail("无法推断 ${_tg3_plat} 的目标 ABI，请用 -DTGCapture3rd_ABI=<abi> 指定")
@@ -134,7 +148,7 @@ endif()
 
 # ------------------------------------------------------------------ 目录解析
 # 与 FfmpegCompileShell 的布局一致：
-#   abi  : <库>/<平台>/<abi>/{include,lib}   android / ohos / linux，或 Windows 一次编多个 ABI
+#   abi  : <库>/<平台>/<abi>/{include,lib}   android / ohos / linux / macos，或 Windows 一次编多个 ABI
 #   flat : <库>/<平台>/{include,lib}         Windows 单 ABI 构建；iOS（fat 库）
 #   lib  : <库>/<平台>/include + lib/<abi>   spdlog（Windows）
 # flat 目录没有 abi 层，靠版本标记文件（version-*.txt 里的 platform 行）核对架构，
@@ -238,6 +252,11 @@ function(_tg3_syslibs out comp)
         endif()
         if(comp MATCHES "^(fdk-aac|openh264)$")
             list(APPEND _libs m)
+        endif()
+    elseif(_tg3_plat STREQUAL "macos")
+        # macOS 的 libSystem 已含 pthread / m / dl；C++ 实现的库靠 IMPORTED_LINK_INTERFACE_LANGUAGES 带上 libc++
+        if(comp STREQUAL "openssl")
+            set(_libs "-framework Security" "-framework CoreFoundation")
         endif()
     elseif(_tg3_plat MATCHES "^(android|ohos)$" AND comp MATCHES "^(fdk-aac|openh264)$")
         set(_libs m)
