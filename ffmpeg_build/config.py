@@ -309,9 +309,11 @@ def whitelist(profile: str = "") -> Dict[str, object]:
 #   flvenc.c  -> h264 插 extract_extradata、aac 插 aac_adtstoasc
 #   mpegtsenc -> h264 插 h264_mp4toannexb
 #   demux.c   -> 缺 extradata 的流插 extract_extradata
+#   mediacodecenc.c -> 宽高不是 16 的倍数时（360p / 540p 等）插 h264_metadata / hevc_metadata
+#                      改写 SPS 的裁剪参数（MediaCodec 只按 16 对齐编码）；缺了 avcodec_open2 直接失败
 # 裁掉任何一个都只在运行期报错（AVERROR_BSF_NOT_FOUND = -1179861752），
 # configure 阶段完全看不出来，所以这里强制并入，不受 profile 白名单影响。
-AUTO_BSFS: List[str] = ["extract_extradata", "null"]
+AUTO_BSFS: List[str] = ["extract_extradata", "h264_metadata", "hevc_metadata", "null"]
 
 
 def whitelist_bsfs(profile: str = "") -> List[str]:
