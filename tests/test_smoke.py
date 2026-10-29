@@ -10,9 +10,10 @@ from types import SimpleNamespace
 
 from ffmpeg_build import recipes
 from ffmpeg_build.cli import build_parser, make_context
-from ffmpeg_build.config import (BUILD_ORDER, DEPS_FILE, DEPS_LIBRARIES, LIBRARIES,
-                                 OPTIONAL_LIBRARIES, PROJECT_ROOT, dep_group, dep_profile,
-                                 resolve_output_root, resolve_selection)
+from ffmpeg_build.config import (BUILD_ORDER, DEPS_FILE, DEPS_LIBRARIES, FFMPEG_DEP_FLAGS,
+                                 FFMPEG_DEPENDENCIES, LIBRARIES, OPTIONAL_LIBRARIES, PROJECT_ROOT,
+                                 TEXT_LIBRARIES, dep_group, dep_profile, resolve_output_root,
+                                 resolve_selection, windows_layout)
 from ffmpeg_build.recipes import REGISTRY
 from ffmpeg_build.toolchains import (LINUX_ABI, OHOS_ABI, OHOSToolchain, LinuxToolchain,
                                      TOOLCHAINS, normalize_platform)
@@ -26,8 +27,21 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(set(LIBRARIES), set(REGISTRY))
 
     def test_build_order_covers_all(self):
-        self.assertEqual(set(BUILD_ORDER) | set(OPTIONAL_LIBRARIES), set(LIBRARIES))
+        self.assertEqual(set(BUILD_ORDER) | set(OPTIONAL_LIBRARIES) | set(TEXT_LIBRARIES), set(LIBRARIES))
         self.assertEqual(BUILD_ORDER[-1], "ffmpeg")   # ffmpeg 依赖其它库，必须最后
+
+    def test_text_scenario_libraries(self):
+        # 文字场景的库：独立分组，默认构建不含，不参与 ffmpeg 构建（ffmpeg 开关不变）
+        self.assertEqual(TEXT_LIBRARIES, ("freetype",))
+        self.assertEqual(dep_group("freetype"), "text")
+        self.assertNotIn("freetype", BUILD_ORDER)
+        self.assertNotIn("freetype", FFMPEG_DEPENDENCIES)
+        self.assertFalse(any("freetype" in f for f in FFMPEG_DEP_FLAGS))
+        spec = DEPS_LIBRARIES["freetype"]
+        self.assertEqual(LIBRARIES["freetype"].version, spec["version"])
+        self.assertTrue(spec["url"].startswith("https://"))
+        self.assertEqual(len(spec["sha256"]), 64)            # 下载包锁哈希
+        self.assertEqual(windows_layout("freetype"), "flat")
 
     def test_no_forbidden_codecs(self):
         for name in FORBIDDEN:
@@ -279,6 +293,25 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(resolve_selection("ffmpeg,srt"), ["ffmpeg", "srt"])
         with self.assertRaises(KeyError):
             resolve_selection("x264")
+
+    def test_selection_with_text(self):
+        # 场景一（默认）不含任何字符集 / 字形库；场景二（--with-text）= 场景一 + freetype
+        self.assertNotIn("freetype", resolve_selection("all"))
+        self.assertEqual(resolve_selection("all", with_text=True), list(BUILD_ORDER) + ["freetype"])
+        self.assertEqual(resolve_selection(None, with_text=True)[-1], "freetype")
+        # 显式点名：只编点名的（已有产物补编 freetype，不重编 ffmpeg）
+        self.assertEqual(resolve_selection("freetype"), ["freetype"])
+        self.assertEqual(resolve_selection("libyuv", with_text=True), ["libyuv"])
+
+    def test_cli_with_text(self):
+        for cmd in ("build", "fetch", "clean"):
+            args = build_parser().parse_args([cmd, "--platform", "linux", "-o", "/tmp/x", "--with-text"])
+            self.assertTrue(args.with_text)
+            args = build_parser().parse_args([cmd, "--platform", "linux", "-o", "/tmp/x"])
+            self.assertFalse(args.with_text)
+        from ffmpeg_build.cli import _ordered
+        self.assertEqual(_ordered("all", True)[-1], "freetype")
+        self.assertNotIn("freetype", _ordered("all", False))
 
 
 class PlatformTest(unittest.TestCase):

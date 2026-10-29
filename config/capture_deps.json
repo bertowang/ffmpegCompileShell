@@ -167,6 +167,24 @@
         }
       }
     },
+    "text": {
+      "description": "文字渲染（时间水印等）的字形库：只有 build --with-text 才编译（或 --libs freetype 显式点名）；默认构建不含。与 FFmpeg 无关 —— ffmpeg 不开 --enable-libfreetype / drawtext，由 TGCapture 内核（-DTG_WITH_TEXT=ON）直接链接",
+      "build_input_of": null,
+      "libraries": {
+        "freetype": {
+          "kind": "archive",
+          "version": "2.15.0",
+          "homepage": "https://freetype.org",
+          "url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz",
+          "tag": "VER-2-15-0",
+          "commit": "37515cf56ba3349656049edbed89ffc6f6466f2d",
+          "strip_components": 1,
+          "sha256": "93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5",
+          "license": "FTL（BSD 风格，需在产品文档中致谢）/ GPLv2 双授权，任选其一",
+          "note": "最小化构建：关闭 zlib / bzip2 / png / harfbuzz / brotli（用自带的 gzip 解码；不需要彩色 emoji 与复杂文字排版），零传递依赖"
+        }
+      }
+    },
     "ffmpeg_hw_sdks": {
       "description": "桌面硬编 SDK：ffmpeg 的构建期输入（不是要编译的库）。只有 --enable-nvenc / --enable-amf 时才拉取；platforms 决定平台适用范围（目前只有 windows，iOS/Android 走 videotoolbox / mediacodec，不用这些 SDK）。头文件不安装到产物目录——运行期靠显卡驱动，不需要头文件",
       "build_input_of": "ffmpeg",

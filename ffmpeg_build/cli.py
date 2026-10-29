@@ -13,7 +13,7 @@ from typing import List
 from . import bootstrap
 from . import deps_env  # noqa: F401  必须在 config 之前：预扫描 --deps/--profile/--config-dir
 from .config import (ACTIVE_PROFILE, BUILD_ORDER, CRT_OPTIONS, DEFAULT_CRT, DEPS_FILE, ENV_OUTPUT,
-                     FFMPEG_DEP_FLAGS, OPTIONAL_LIBRARIES, BuildContext, LIBRARIES, dep_group,
+                     FFMPEG_DEP_FLAGS, OPTIONAL_LIBRARIES, TEXT_LIBRARIES, BuildContext, LIBRARIES, dep_group,
                      dep_profile, dep_source, is_portable, resolve_output_root, resolve_selection, whitelist)
 from .recipes import REGISTRY
 from .toolchains import TOOLCHAINS, create_toolchain, normalize_platform
@@ -39,6 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "  python build.py build --platform android --abi arm64-v8a -o D:/work/TGCapture3rd\n"
                 "  python build.py build --platform ios --libs ffmpeg -o D:/work/TGCapture3rd\n"
                 "  OHOS_SDK=~/ohos-sdk python build.py build --platform ohos -o D:/work/TGCapture3rd\n"
+                "两种依赖场景（ffmpeg 产物相同，区别只在是否带字符集 / 字形库）:\n"
+                "  python build.py build --platform windows -o D:/work/TGCapture3rd              # 现有依赖\n"
+                "  python build.py build --platform windows --with-text -o D:/work/TGCapture3rd-text  # + freetype\n"
+                "  python build.py build --platform windows --libs freetype -o D:/work/TGCapture3rd   # 已有产物补编\n"
                 "指定依赖锁定文件（默认 --profile capture → config/capture_deps.json）:\n"
                 "  python build.py build --platform windows --config-dir D:/work/mycfg\n"
                 "  python build.py build --platform windows --profile player   # config/player_deps.json\n"
@@ -92,6 +96,10 @@ def _common(parser: argparse.ArgumentParser, require_output: bool = True) -> Non
     parser.add_argument("-p", "--platform", required=True, help=PLATFORM_HELP)
     parser.add_argument("--abi", nargs="*", default=None, help=ABI_HELP)
     parser.add_argument("--libs", default="all", help="要处理的库，逗号分隔")
+    parser.add_argument("--with-text", action="store_true",
+                        help="文字场景：在默认库（all）之外再编 freetype（时间水印的中文 / TrueType 渲染，"
+                             "TGCapture 用 -DTG_WITH_TEXT=ON 链接）。不加 = 现有依赖场景，不含任何字符集库。"
+                             "ffmpeg 产物两个场景相同；已有产物只想补编文字库：--libs freetype")
     parser.add_argument("-o", "--output", default=None,
                         help=f"产物输出目录（必填；也可设环境变量 {ENV_OUTPUT}）")
     parser.add_argument("-j", "--jobs", type=int, default=0, help="并行任务数")
@@ -159,6 +167,11 @@ def cmd_list(args, logger: Logger) -> int:
     for name in OPTIONAL_LIBRARIES:
         lib = LIBRARIES[name]
         logger.info(f"{name:<10} {lib.version:<10} {lib.summary}")
+    if TEXT_LIBRARIES:
+        logger.section("文字场景（build --with-text 时追加；或 --libs freetype 单独补编）")
+        for name in TEXT_LIBRARIES:
+            lib = LIBRARIES[name]
+            logger.info(f"{name:<10} {lib.version:<10} {lib.summary}")
     logger.info("不使用 x264 / x265 / v265")
     return 0
 
@@ -176,7 +189,7 @@ def cmd_bootstrap(args, logger: Logger) -> int:
 
 def cmd_fetch(args, logger: Logger) -> int:
     ctx = make_context(args, logger, require_output=False)
-    for name in _ordered(args.libs):
+    for name in _ordered(args.libs, args.with_text):
         logger.section(f"fetch {name}")
         # 按平台取源码：命中 platform_overrides 的库（如 OHOS 的 ffmpeg fork）
         # 要在这一步就拉对，否则后面 build 会因锁定值不一致再拉一次
@@ -192,13 +205,16 @@ def cmd_build(args, logger: Logger) -> int:
         bootstrap.ensure_ready(ctx.platform, logger, ctx.runner, ctx)
     ctx.toolchain.prepare()
 
-    libraries = _ordered(args.libs)
+    libraries = _ordered(args.libs, args.with_text)
     if args.clean:
         _clean(ctx, libraries, output_too=True)
 
     logger.section(f"开始编译: {ctx.summary}")
     logger.info(f"依赖锁定文件: {DEPS_FILE} (profile={ACTIVE_PROFILE})")
     logger.info(_profile_summary())
+    text_libs = [n for n in libraries if n in TEXT_LIBRARIES]
+    logger.info(f"依赖场景: {'文字（带 ' + ','.join(text_libs) + '）' if text_libs else '现有依赖（不含字符集 / 字形库）'}"
+                f"；本次编译: {','.join(libraries)}")
     if ctx.platform == "windows":
         logger.info(f"Windows 运行时库: {getattr(ctx.toolchain, 'crt_flag', '/MT')}"
                     f"（--crt {ctx.crt}；openssl/ffmpeg 始终 /MT）")
@@ -250,7 +266,7 @@ def cmd_build(args, logger: Logger) -> int:
 
 def cmd_clean(args, logger: Logger) -> int:
     ctx = make_context(args, logger)
-    _clean(ctx, _ordered(args.libs), output_too=args.all)
+    _clean(ctx, _ordered(args.libs, args.with_text), output_too=args.all)
     logger.info("清理完成")
     return 0
 
@@ -320,9 +336,9 @@ def export_cmake_package(root: Path, logger: Logger) -> List[Path]:
 
 
 # ------------------------------------------------------------------ 辅助
-def _ordered(selection: str) -> List[str]:
+def _ordered(selection: str, with_text: bool = False) -> List[str]:
     from .config import BUILD_ORDER
-    names = resolve_selection(selection)
+    names = resolve_selection(selection, with_text)
     ordered = [n for n in BUILD_ORDER if n in names]
     return ordered + [n for n in names if n not in ordered]
 

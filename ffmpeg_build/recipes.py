@@ -384,6 +384,53 @@ def build_libyuv(ctx, abi: str) -> Path:
     return stage
 
 
+# ------------------------------------------------------------------ freetype
+# 文字场景（build --with-text）专用：TGCapture 内核 -DTG_WITH_TEXT=ON 时直接链接，用于时间水印的
+# 中文 / TrueType 渲染。与 ffmpeg 无关（ffmpeg 不开 --enable-libfreetype），所以两个场景的 ffmpeg 产物相同。
+# 最小化构建：zlib / bzip2 / png / harfbuzz / brotli / hvf 全关 —— 零传递依赖，消费方只需链 freetype 本身
+# （gzip 压缩的 PCF 字体用 freetype 自带的 zlib 副本解；彩色 emoji / 复杂文字排版不需要）。
+FREETYPE_CANDIDATES = ("freetype.lib", "libfreetype.a", "freetype.a")
+
+
+def build_freetype(ctx, abi: str) -> Path:
+    _set_current("freetype")
+    src = ctx.sources.ensure(C.dep_source("freetype", ctx.platform), ctx.source_dir("freetype"), ctx.force_fetch)
+    build_dir = ctx.work_dir("freetype", abi) / "cmake-build"
+    cmake_configure(ctx, src, build_dir, abi, extra=[
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DFT_DISABLE_ZLIB=ON",           # ON = 不找系统 zlib，改用内置副本（不产生外部依赖）
+        "-DFT_DISABLE_BZIP2=ON",
+        "-DFT_DISABLE_PNG=ON",
+        "-DFT_DISABLE_HARFBUZZ=ON",
+        "-DFT_DISABLE_BROTLI=ON",
+        # macOS 15+ SDK 自带 hvf（Apple 私有矢量字体），不关会被自动探测到并引用 libhvf 的符号 —— 消费方链接失败
+        "-DFT_DISABLE_HVF=ON",
+        "-DFT_ENABLE_ERROR_STRINGS=OFF",
+        "-DDISABLE_FORCE_DEBUG_POSTFIX=ON",   # 不给库名加 d 后缀
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_BZip2=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_PNG=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_HarfBuzz=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_BrotliDec=ON",
+    ])
+    cmake_build(ctx, build_dir, abi, target="freetype", lib="freetype")
+    cmake_install(ctx, build_dir, abi, lib="freetype")
+
+    stage = ctx.stage_dir("freetype", abi)
+    if ctx.dry_run:
+        return stage
+    # 安装规则会带出 cmake 包配置与 pkgconfig（含编译机绝对路径），产物里只留 include/freetype2 与静态库
+    lib_dir = ensure_dir(stage / "lib")
+    for sub in ("cmake", "pkgconfig"):
+        shutil.rmtree(lib_dir / sub, ignore_errors=True)
+    if not (stage / "include" / "freetype2" / "ft2build.h").is_file():
+        raise RuntimeError(f"freetype 头文件未安装到 {stage / 'include' / 'freetype2'}")
+    if not any((lib_dir / n).is_file() for n in FREETYPE_CANDIDATES):
+        raise RuntimeError(f"freetype 静态库未生成: {lib_dir}")
+    return stage
+
+
 # ---------------------------------------------------------------------- json
 def build_json(ctx, abi: str) -> Path:
     """header-only：只搬头文件。
@@ -1061,6 +1108,7 @@ REGISTRY = {
     "fdk-aac": build_fdk_aac,
     "openh264": build_openh264,
     "libyuv": build_libyuv,
+    "freetype": build_freetype,
     "json": build_json,
     "spdlog": build_spdlog,
     "ffmpeg": build_ffmpeg,

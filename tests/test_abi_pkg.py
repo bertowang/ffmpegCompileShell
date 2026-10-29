@@ -211,6 +211,50 @@ class CMakePackageTest(unittest.TestCase):
             self.assertNotIn("/old/abs/path", deps)            # 旧绝对路径（-L）不带出
             self.assertIn("V2=0", out.stdout)                  # 主版本不同不兼容
 
+    @unittest.skipUnless(shutil.which("cmake"), "需要 cmake")
+    def test_find_package_freetype_component(self):
+        """文字场景：有 freetype 时导入目标的头文件目录是 include/freetype2；没有时组件 FOUND=0 并给出原因。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "3rd"
+            abi = "x86_64"
+            d = root / "libyuv" / "linux" / abi
+            (d / "include").mkdir(parents=True)
+            (d / "lib").mkdir()
+            (d / "lib" / "libyuv.a").write_bytes(b"")
+            export_cmake_package(root, Logger(verbose=False))
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.16)\nproject(p NONE)\n"
+                "set(TGCapture3rd_PLATFORM linux)\nset(TGCapture3rd_ABI x86_64)\n"
+                "find_package(TGCapture3rd 1 CONFIG QUIET COMPONENTS libyuv freetype)\n"
+                "message(STATUS \"FT=${TGCapture3rd_freetype_FOUND} ALL=${TGCapture3rd_FOUND}\")\n"
+                "if(TARGET TGCapture3rd::freetype)\n"
+                "  get_target_property(i TGCapture3rd::freetype INTERFACE_INCLUDE_DIRECTORIES)\n"
+                "  message(STATUS \"INC=${i}\")\n"
+                "endif()\n", encoding="utf-8")
+
+            def configure():
+                shutil.rmtree(proj / "b", ignore_errors=True)
+                return subprocess.run(["cmake", "-S", str(proj), "-B", str(proj / "b"),
+                                       f"-DCMAKE_PREFIX_PATH={root.as_posix()}"],
+                                      capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+            out = configure()          # 场景一的产物：没有 freetype
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertRegex(out.stdout, r"FT=(0|FALSE) ALL=0")
+
+            ft = root / "freetype" / "linux" / abi
+            (ft / "include" / "freetype2").mkdir(parents=True)
+            (ft / "include" / "freetype2" / "ft2build.h").write_text("")
+            (ft / "lib").mkdir()
+            (ft / "lib" / "libfreetype.a").write_bytes(b"")
+            out = configure()          # 场景二的产物：多出 freetype
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("ALL=1", out.stdout)
+            inc = next(line for line in out.stdout.splitlines() if "INC=" in line)
+            self.assertTrue(inc.rstrip().endswith("include/freetype2"), inc)
+
 
 if __name__ == "__main__":
     unittest.main()

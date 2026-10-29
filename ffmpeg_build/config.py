@@ -37,6 +37,7 @@ CRT_OPTIONS = ("mt", "md")
 WINDOWS_LAYOUT: Dict[str, str] = {
     "ffmpeg": "flat",
     "libyuv": "flat",
+    "freetype": "flat",
     "spdlog": "lib",
     "zlib": "flat",
     "openssl": "flat",
@@ -377,6 +378,8 @@ _LIBRARY_SUMMARY: Dict[str, str] = {
     # 其 find_package(spdlog 1.14.1 REQUIRED) 会限制这里能升到的版本
     "spdlog": "C++ 日志库（MediaX/ESLogger 的日志实现；TGCapture 自带 Logger，可不链）",
     "ffmpeg": "封装 + 协议（按 profile 的裁剪白名单）",
+    # 文字场景（--with-text）：TGCapture 内核 -DTG_WITH_TEXT=ON 时直接链接，用于时间水印的中文 / TrueType 渲染
+    "freetype": "字形渲染（时间水印的中文 / TrueType 字体；仅 --with-text 场景，与 ffmpeg 无关）",
 }
 
 LIBRARIES: Dict[str, Library] = {
@@ -389,9 +392,13 @@ _ALL_BUILD_ORDER = ("zlib", "openssl", "srt", "fdk-aac", "openh264", "libyuv", "
 # 默认不构建：json 是 header-only（MediaX 侧通常已由 3rd submodule 提供），
 # spdlog 只有 MediaX 的 ESLogger 需要（TGCapture 自带 Logger），均按需 --libs xxx
 _ALL_OPTIONAL = ("json", "spdlog")
+# 文字场景的库：默认构建（场景一：现有依赖）不含；build --with-text（场景二：支持字符与时间显示）追加。
+# 它们不参与 ffmpeg 构建，所以两个场景的 ffmpeg 产物完全相同，--with-text 只是多出这些库
+_ALL_TEXT = ("freetype",)
 
 BUILD_ORDER = tuple(n for n in _ALL_BUILD_ORDER if n in LIBRARIES)
 OPTIONAL_LIBRARIES = tuple(n for n in _ALL_OPTIONAL if n in LIBRARIES)
+TEXT_LIBRARIES = tuple(n for n in _ALL_TEXT if n in LIBRARIES)
 DEFAULT_SELECTION = BUILD_ORDER
 
 # ffmpeg 的外部库依赖与对应 configure 开关，全部来自锁定文件的 ffmpeg_deps 组：
@@ -402,9 +409,17 @@ FFMPEG_DEP_FLAGS: List[str] = [spec["ffmpeg_flag"] for n in FFMPEG_DEPENDENCIES
                                for spec in [DEPS_LIBRARIES[n]] if spec.get("ffmpeg_flag")]
 
 
-def resolve_selection(selection: Optional[str]) -> List[str]:
+def resolve_selection(selection: Optional[str], with_text: bool = False) -> List[str]:
+    """--libs 的解析。with_text（--with-text）在默认选择 all 上追加文字场景的库；
+    显式点名时只认点名的库（--libs freetype 可单独补编，不必重编 ffmpeg）。"""
     if not selection or selection.strip().lower() in ("all", "*"):
-        return list(DEFAULT_SELECTION)
+        names = list(DEFAULT_SELECTION)
+        if with_text:
+            if not TEXT_LIBRARIES:
+                raise KeyError(f"--with-text 需要锁定文件里有文字库（{', '.join(_ALL_TEXT)}），"
+                               f"当前 {DEPS_FILE.name} 里没有")
+            names += [n for n in TEXT_LIBRARIES if n not in names]
+        return names
     names = [item.strip() for item in selection.split(",") if item.strip()]
     unknown = [n for n in names if n not in LIBRARIES]
     if unknown:

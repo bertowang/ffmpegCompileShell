@@ -86,10 +86,41 @@
 | json | 3.12.0 | nlohmann/json，header-only；MediaX 侧通常已由 `ESMediaX/3rd/json` submodule 提供，需要时 `--libs json` |
 | spdlog | v1.14.1 | C++ 日志库（编译型静态库）。只有 **MediaX** 需要：其 `ESLogger` 基于 spdlog 实现（android_sink / msvc_sink / OHOS hilog callback_sink + Windows Release 异步日志）；TGCapture 自带 `core/Logger.h`，不链。需要时 `--libs spdlog` |
 
+文字场景（**默认不构建**，见 [1.5](#15-两种依赖场景现有依赖--带字符集字形库)）：
+
+| 库 | 版本 | 说明 |
+| - | - | - |
+| freetype | 2.15.0 | 字形渲染（TrueType / OpenType）。**与 ffmpeg 无关**（ffmpeg 不开 `--enable-libfreetype` / drawtext），由 TGCapture 内核 `-DTG_WITH_TEXT=ON` 直接链接，用于时间水印的中文渲染。`--with-text` 追加构建，或 `--libs freetype` 单独补编 |
+
 不使用 x264 / x265 / v265；cuda-samples(NPP) 经复核非开播编译期依赖，不纳入。
 
 **AMF 与 nv-codec-headers** 是 Windows 硬编（`h264_amf` / `h264_nvenc`）的**构建期输入**（只要头文件，
 不编译、运行期靠显卡驱动），默认不参与构建，需要时按 [1.4](#14-windows-硬编nvenc--amf) 打开开关。
+
+### 1.5 两种依赖场景（现有依赖 / 带字符集·字形库）
+
+部分场景只推流、画面上不需要文字；需要文字的场景才要字形库。**用 `--with-text` 区分，两个场景分别发起编译与集成**：
+
+| 场景 | 命令 | 产物 | 消费方 |
+| - | - | - | - |
+| 2.1 现有依赖（默认） | `python build.py build -p <平台> -o <输出根>` | zlib / openssl / srt / fdk-aac / openh264 / libyuv / ffmpeg | 正常构建，不链任何字符集库 |
+| 2.2 支持字符与时间显示 | `python build.py build -p <平台> --with-text -o <输出根>` | 上面 7 个 **+ freetype** | `-DTG_WITH_TEXT=ON` |
+
+要点：
+
+* **ffmpeg 不需要重编**：freetype 不在 `ffmpeg_deps` 组，不产生任何 `--enable-*` 开关，两个场景的
+  ffmpeg 产物**完全一致**（同样的 configure、同样的白名单）。差别只是产物目录里多一个 `freetype/`。
+  因此 `--with-text` 也可以只在已有产物上补编：`python build.py build -p <平台> --libs freetype -o <已存在的输出根>`。
+* **默认构建不会引入 freetype**：`--libs all`（默认）只包含必须库；不想要文字的场景不会拉进无关依赖。
+* 想让两个场景的产物**物理分开**（交付时只带需要的），给不同的 `-o`（例如 `TGCapture3rd` 与 `TGCapture3rd-text`）。
+* 升级本工程后，旧产物目录要补一次 `python build.py export -o <产物根目录>` 才会认识 `freetype` 组件
+  （包配置是每次 `build` / `export` 时刷到产物根目录的）。
+* CMake 包配置（`find_package(TGCapture3rd)`）按**组件**暴露：`COMPONENTS ffmpeg libyuv` 不含 freetype，
+  加 `freetype` 才会去找 freetype 产物（找不到即 `TGCapture3rd_freetype_FOUND=0` 并给出补编提示）。
+  头文件目录为 `<输出根>/freetype/<平台>[/<abi>]/include/freetype2`（`#include <ft2build.h>`）。
+* freetype 按最小化构建：zlib / bzip2 / png / harfbuzz / brotli / HVF 全关（macOS 15+ SDK 自带 HVF，
+  不关会引用系统私有库 `libhvf` 的符号），**零传递依赖**，只链 `libfreetype.a` / `freetype.lib` 本身；
+  授权为 FTL（BSD 风格，需在产品文档致谢）/ GPLv2 双授权。
 
 ### 1.1 依赖锁定文件 `config/capture_deps.json`
 
@@ -556,7 +587,8 @@ python build.py build --platform windows -j 8            -o %OUT%  # 指定并�
 | - | - | - |
 | `-p/--platform` | `windows` / `linux` / `android` / `ios` / `ohos`（别名见第 0 节） | 必填 |
 | `--abi` | 多个值用**空格或逗号**分隔，不认识的值直接报错。windows `x64`/`x86`/`arm64`；linux `x86_64`/`arm64`/`armhf`；android `arm64-v8a`/`armeabi-v7a`/`x86_64`；ios `arm64`/`x86_64`/`fat`（别名 `device`/`simulator`）；ohos `arm64-v8a`/`armeabi-v7a`/`x86_64`；`all` 的含义按平台不同（见第 0 节）。`bootstrap` 也接受 `--abi`，按目标 ABI 自检 | 平台默认（第 0 节） |
-| `--libs` | 逗号分隔，`all` 为必须库全集（不含可选的 json / spdlog） | `all` |
+| `--libs` | 逗号分隔，`all` 为必须库全集（不含可选的 json / spdlog 与文字场景的 freetype） | `all` |
+| `--with-text` | 文字场景：在 `all` 之外再编 freetype（时间水印的中文 / TrueType）。两个场景的 ffmpeg 产物相同，详见 [1.5](#15-两种依赖场景现有依赖--带字符集字形库) | 关 |
 | `-o/--output` | 产物输出目录（`fetch` 不需要） | **必填**（或环境变量 `FFMPEG_3RD_OUTPUT`） |
 | `-j/--jobs` | 并行任务数 | CPU-1 |
 | `--toolchain` | Windows 工具链偏好 `auto`/`msvc`/`mingw`。`mingw` 尚未打通（openssl 需要 nmake，ffmpeg / openh264 写死了 msvc），实际只能用 MSVC | `auto`（优先 MSVC） |
@@ -763,6 +795,7 @@ add_custom_command(TARGET app POST_BUILD
 | `ffmpeg` | `TGCapture3rd::avformat` / `avcodec` / `avfilter` / `swscale` / `swresample` / `avutil`，汇总目标 `TGCapture3rd::ffmpeg` | Windows 为 `SHARED IMPORTED`（`.lib` + DLL）；其它平台为静态库，openssl / srt / fdk-aac / openh264 / zlib 与系统库按 ffmpeg 自己的 `.pc` 自动传递（`.pc` 里旧的绝对 `-L` 路径会被忽略，产物整体挪位置也能用） |
 | `openssl` | `TGCapture3rd::ssl` / `TGCapture3rd::crypto`，汇总 `TGCapture3rd::openssl` | 静态库，Windows 自带 ws2_32 / crypt32 等系统库 |
 | `zlib` `srt` `fdk-aac` `openh264` `libyuv` `spdlog` `json` | `TGCapture3rd::<组件名>` | 静态库；`spdlog` 带 `SPDLOG_COMPILED_LIB`，`json` 为 header-only |
+| `freetype` | `TGCapture3rd::freetype` | 文字场景（`--with-text`）：静态库，头文件目录 `…/include/freetype2`；不含该组件时 `TGCapture3rd_freetype_FOUND=0`（见 [1.5](#15-两种依赖场景现有依赖--带字符集字形库)） |
 
 * **平台 / ABI 自动推断**：Windows 按编译器目标架构（`-A x64|Win32|ARM64`），Android 按 `ANDROID_ABI`，
   OHOS 按 `OHOS_ARCH`，Linux 按 `CMAKE_SYSTEM_PROCESSOR`，iOS 用 fat 库；也可以用 `-DTGCapture3rd_PLATFORM=` / `-DTGCapture3rd_ABI=` 指定。

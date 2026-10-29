@@ -21,6 +21,7 @@
 #             其它平台为静态库，openssl/srt/fdk-aac/openh264/zlib 与系统库按 ffmpeg 的 .pc 自动带上
 #   openssl   TGCapture3rd::ssl / TGCapture3rd::crypto，汇总目标 TGCapture3rd::openssl
 #   zlib srt fdk-aac openh264 libyuv spdlog json   TGCapture3rd::<组件名>
+#   freetype  TGCapture3rd::freetype（文字场景：build --with-text 才有；头文件目录为 include/freetype2）
 #
 # 输出变量：
 #   TGCapture3rd_FOUND、TGCapture3rd_<组件>_FOUND / _PREFIX / _VERSION、
@@ -32,7 +33,7 @@ cmake_policy(VERSION 3.16...3.31)
 
 get_filename_component(TGCapture3rd_ROOT "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
 # 依赖在前、ffmpeg 最后：静态 ffmpeg 要引用前面这些库的导入目标
-set(TGCapture3rd_ALL_COMPONENTS zlib openssl srt fdk-aac openh264 libyuv spdlog json ffmpeg)
+set(TGCapture3rd_ALL_COMPONENTS zlib openssl srt fdk-aac openh264 libyuv freetype spdlog json ffmpeg)
 set(_TG3_FFMPEG_DEPS zlib openssl srt fdk-aac openh264)
 set(_TG3_FFMPEG_LIBS avutil swresample swscale postproc avcodec avformat avfilter avdevice)
 
@@ -325,6 +326,26 @@ function(_tg3_load_spdlog)
     _tg3_result(TRUE "")
 endfunction()
 
+# freetype（文字场景，build --with-text 才有）：头文件在 include/freetype2（#include <ft2build.h>）
+function(_tg3_load_freetype)
+    _tg3_locate(freetype)
+    if(_why)
+        _tg3_result(FALSE "${_why}（文字场景的库：FfmpegCompileShell build --with-text 或 --libs freetype）")
+        return()
+    endif()
+    _tg3_pick(_file "${_ld}" freetype.lib libfreetype.a freetype.a)
+    if(NOT _file)
+        _tg3_result(FALSE "${_ld} 里没有 freetype 静态库")
+        return()
+    endif()
+    if(NOT EXISTS "${_p}/include/freetype2/ft2build.h")
+        _tg3_result(FALSE "缺少 ${_p}/include/freetype2/ft2build.h")
+        return()
+    endif()
+    _tg3_add_static(TGCapture3rd::freetype "${_file}" "${_p}/include/freetype2")
+    _tg3_result(TRUE "")
+endfunction()
+
 function(_tg3_load_json)
     # header-only：与平台无关，<根>/json/{single_include,include}
     set(_p "${TGCapture3rd_ROOT}/json")
@@ -552,10 +573,14 @@ function(_tg3_load comp)
         _tg3_load_simple(srt TGCapture3rd::srt srt_static.lib srt.lib libsrt.lib libsrt.a)
     elseif(comp STREQUAL "fdk-aac")
         _tg3_load_simple(fdk-aac TGCapture3rd::fdk-aac fdk-aac.lib libfdk-aac.lib libfdk-aac.a)
+    elseif(comp STREQUAL "freetype")
+        _tg3_load_freetype()
     elseif(comp STREQUAL "openh264")
         _tg3_load_simple(openh264 TGCapture3rd::openh264 openh264.lib libopenh264.lib libopenh264.a)
     elseif(comp STREQUAL "libyuv")
         _tg3_load_simple(libyuv TGCapture3rd::libyuv yuv.lib libyuv.lib libyuv.a libyuv_static.a)
+    elseif(comp STREQUAL "freetype")
+        _tg3_load_freetype()
     endif()
     set(_tg3_found ${_tg3_found} PARENT_SCOPE)
     set(_tg3_reason "${_tg3_reason}" PARENT_SCOPE)
@@ -590,6 +615,9 @@ foreach(_c IN LISTS TGCapture3rd_ALL_COMPONENTS)
         continue()
     endif()
     _tg3_load(${_c})
+    # 找不到时的原因也按组件名导出（放在最前：缺必需组件时下面会直接 _tg3_fail 终止）。
+    # 用普通 set()：find_package 会把文件作用域的变量带回调用方，PARENT_SCOPE 反而带不回去
+    set(TGCapture3rd_${_c}_REASON "${_tg3_reason}")
     set(TGCapture3rd_${_c}_FOUND ${_tg3_found})
     set(TGCapture3rd_${_c}_PREFIX "${_tg3_prefix}")
     set(TGCapture3rd_${_c}_VERSION "${_tg3_version}")
