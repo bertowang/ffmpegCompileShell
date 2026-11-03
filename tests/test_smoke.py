@@ -384,20 +384,23 @@ class PlatformOverrideTest(unittest.TestCase):
     def test_override_only_for_matching_platform(self):
         from ffmpeg_build.config import dep_source
         ffmpeg = dep_source("ffmpeg")
-        self.assertTrue(ffmpeg.url.startswith("https://git.woa.com"))     # 默认仍是内网
-        linux = dep_source("ffmpeg", "linux")
-        self.assertNotEqual(linux.url, ffmpeg.url)
-        self.assertTrue(linux.commit)                                     # 覆盖项也要锁 commit
+        self.assertIn("github.com", ffmpeg.url)                          # 默认是上游官方仓库（不再用内网）
+        self.assertNotIn("git.woa.com", ffmpeg.url)
+        ohos = dep_source("ffmpeg", "ohos")
+        self.assertNotEqual(ohos.url, ffmpeg.url)                        # OHOS 仍用 openharmony-tpc fork
+        self.assertTrue(ohos.ref)                                        # 覆盖项锁定分支（OHOS fork 只锁分支）
         self.assertEqual(dep_source("ffmpeg", "windows").url, ffmpeg.url)  # 未命中沿用原条目
 
     def test_override_is_not_ffmpeg_only(self):
-        # fdk-aac 在 Linux 上换上游镜像（commit 与内网版相同），证明这是通用能力
+        # 覆盖机制是通用的：ffmpeg 的 ohos 用 openharmony-tpc fork（与默认官方仓库不同）；
+        # fdk-aac 默认就走上游 GitHub，无需覆盖，证明默认源已是开源地址
         from ffmpeg_build.config import dep_source
         default = dep_source("fdk-aac")
-        linux = dep_source("fdk-aac", "linux")
-        self.assertTrue(default.url.startswith("https://git.woa.com"))
-        self.assertIn("github.com", linux.url)
-        self.assertEqual(linux.commit, default.commit)   # 同一份源码，只换下载地址
+        self.assertIn("github.com", default.url)
+        self.assertNotIn("git.woa.com", default.url)
+        ff_ohos = dep_source("ffmpeg", "ohos")
+        self.assertNotIn("github.com", ff_ohos.url)   # OHOS fork 在 gitee
+        self.assertTrue(ff_ohos.ref)                  # 覆盖项锁定分支
 
 
 class OHOSTest(unittest.TestCase):

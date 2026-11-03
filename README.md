@@ -157,8 +157,8 @@ python build.py build --platform windows --deps D:/work/capture_deps.json ...   
 "libyuv":  { "kind": "git", "version": "1974", "url": "https://chromium.googlesource.com/libyuv/libyuv",
              "ref": "2404f9730e2e48946d29c6d28e3b630302a8d842", "commit": "2404f9730e2e48946d29c6d28e3b630302a8d842" },
 "ffmpeg":  { "kind": "git", "version": "6.1.6",
-             "url": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6.git",   // 唯一使用内网的库
-             "commit": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1" }
+             "url": "https://github.com/FFmpeg/FFmpeg.git",   // 上游 GitHub 官方仓库
+             "commit": "f1e3a2bf7a2f2cde936d1ed97f09a26853d20125" }
 ```
 
 分四组（与 ffmpeg 的耦合关系）：
@@ -172,7 +172,7 @@ python build.py build --platform windows --deps D:/work/capture_deps.json ...   
 
 规则：
 
-* **内网仓库**（`EST/media/e-ffmpeg`）：`ffmpeg`（ffmpeg-6.1.6）、`fdk-aac`（fdk_aac_v2.0.3）。
+* **上游 GitHub 仓库**：`ffmpeg`（FFmpeg/FFmpeg 6.1.6）、`fdk-aac`（mstorsjo/fdk-aac v2.0.3）；ffmpeg 的 OHOS 平台改用 openharmony-tpc 的 fork。
 * **硬编 SDK 用上游官方仓库并锁 tag**：`amf` → `GPUOpen-LibrariesAndSDKs/AMF` `v1.4.34`、
   `nv-codec-headers` → `FFmpeg/nv-codec-headers` `n12.0.16.1`（两者都同时锁 commit，见 1.4）。
 * 其余库用**上游官方仓库**，取锁定日（`updated` 字段）的最新正式发布版；
@@ -440,7 +440,7 @@ TGCapture3rd/
 # ① 检查并补齐工具链（缺 MSVC / 原生 Perl 会自动下载；winget 可用时自动静默安装）
 python build.py bootstrap --platform windows --install
 
-# ②（可选）只拉源码，确认内网/外网可达
+# ②（可选）只拉源码，确认 GitHub 可达
 python build.py fetch --platform windows
 
 # ③ 编译全部依赖 -> D:/work/TGCapture3rd（目录必填）
@@ -488,9 +488,10 @@ python3 build.py build --platform linux -o ~/TGCapture3rd-linux --libs ffmpeg
   这是本机编译平台（Windows / Linux）独有的好处，交叉编译的平台跑不了产物。
 * **x86 汇编需要 nasm**；没有时自动 `--disable-x86asm`（openh264 用 `USE_ASM=No`），
   不会编译到一半才失败。注意脚本把 `yasm` 也当作可用，但 ffmpeg 6.1 的 x86 汇编需要 nasm，请装 nasm。
-* **内网仓库不可达时的兜底**：`ffmpeg` 与 `fdk-aac` 在锁定文件里带 `platform_overrides.linux`，
-  改用上游 GitHub 的同版本（ffmpeg → `n6.1.6`；fdk-aac → `v2.0.3`，其 commit 与内网版完全相同）。
-  这是**通用的按平台换源**能力（任何库都能写 `platform_overrides`），其它平台仍走内网。
+* **ffmpeg / fdk-aac 默认即上游 GitHub 官方仓库**：`ffmpeg` → `FFmpeg/FFmpeg` `n6.1.6`、
+  `fdk-aac` → `mstorsjo/fdk-aac` `v2.0.3`（commit 与原内网版完全相同）；ffmpeg 的 OHOS 平台仍用
+  `platform_overrides` 换 openharmony-tpc 的 fork（仅该分支支持 `--enable-ohosavcodecdecoder`）。
+  这是**通用的按平台换源**能力（任何库都能写 `platform_overrides`）。
 * **RHEL 系发行版**（TencentOS / CentOS / Rocky）上 CMake 与 openssl 默认装到 `lib64`，
   而 ffmpeg 的 configure 固定按 `<prefix>/lib` 找依赖 —— 脚本会在安装后把 `lib64`
   收敛到 `lib`，产物布局与其它平台一致（见 `recipes.py::collapse_lib_dirs`）。

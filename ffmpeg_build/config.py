@@ -96,7 +96,7 @@ def is_portable(lib: str) -> bool:
 # 默认 config/capture_deps.json（开播）；播放将来用 config/player_deps.json。
 DEPS_FILE = deps_file()
 ACTIVE_PROFILE = active_profile()
-FFMPEG_REPO = "git@git.woa.com:EST/media/e-ffmpeg/ffmpeg-6.1.6.git"   # 兼容旧引用
+FFMPEG_REPO = "https://github.com/FFmpeg/FFmpeg.git"   # 兼容旧引用（已统一为上游 GitHub 官方仓库）
 FFMPEG_REF = "master"
 
 
@@ -181,7 +181,7 @@ def dep_source(name: str, platform: str = ""):
     "同一份锁定文件、按平台换来源"是通用需求，不该只给 ffmpeg 开小灶：
 
       * OHOS 要用 openharmony-tpc 的 fork（``--enable-ohosavcodecdecoder`` 只有它有）；
-      * Linux 上内网 ``git.woa.com`` 不可达时，改用上游官方仓库的同版本镜像。
+      * ffmpeg、fdk-aac 默认已统一使用上游 GitHub 官方仓库（FFmpeg/FFmpeg、mstorsjo/fdk-aac）。
 
     因此做成通用能力：任何库都能在自己的条目里写 ``platform_overrides``，
     未命中的平台仍用条目本身的 address/version/commit。

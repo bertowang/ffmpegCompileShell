@@ -4,7 +4,7 @@
   "updated": "2026-10-19",
   "description": "开播(capture)专用的依赖锁定文件：固定每个库的来源地址、版本与 commit。给定本文件即可复现出完全相同的目标库；升级版本只需改这里。",
   "rules": {
-    "internal": "ffmpeg、fdk-aac 使用内网仓库 https://git.woa.com/EST/media/e-ffmpeg/<name>.git",
+    "github": "ffmpeg、fdk-aac 使用上游 GitHub 官方仓库（FFmpeg/FFmpeg、mstorsjo/fdk-aac）；ffmpeg 的 OHOS 平台用 openharmony-tpc 的 fork",
     "others": "其余库使用上游官方仓库，取截止 updated 日期的最新正式发布版（release tag）；为兼容 MediaX 时锁旧版并在 note 中说明"
   },
   "groups": {
@@ -20,12 +20,11 @@
               "kind": "git",
               "version": "6.1.6",
               "profile": "capture",
-              "homepage": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6",
-              "url": "https://git.woa.com/EST/media/e-ffmpeg/ffmpeg-6.1.6.git",
-              "tag": "",
-              "ref": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1",
-              "commit": "3c1fc5dfaec5687d9c418e119f1dadd7a97553b1",
-              "internal": true,
+              "homepage": "https://github.com/FFmpeg/FFmpeg",
+              "url": "https://github.com/FFmpeg/FFmpeg.git",
+              "tag": "n6.1.6",
+              "ref": "n6.1.6",
+              "commit": "f1e3a2bf7a2f2cde936d1ed97f09a26853d20125",
               "platform_overrides": {
                 "ohos": {
                   "kind": "git",
@@ -35,16 +34,6 @@
                   "ref": "ohos-n6.1.2_dev",
                   "commit": "",
                   "note": "OHOS 需 openharmony-tpc 的 fork（--enable-ohosavcodecdecoder 仅该分支有）"
-                },
-                "linux": {
-                  "kind": "git",
-                  "version": "6.1.6",
-                  "url": "https://github.com/FFmpeg/FFmpeg.git",
-                  "tag": "n6.1.6",
-                  "ref": "n6.1.6",
-                  "commit": "f1e3a2bf7a2f2cde936d1ed97f09a26853d20125",
-                  "internal": false,
-                  "note": "内网 git.woa.com 需要工蜂鉴权，在 Linux 构建机上匿名拉取会失败；故该平台改用上游官方仓库的同版本 n6.1.6（版本与内网版一致，commit 单独锁定保证可复现）；9266ee0 是 n6.1.6 的附注标签对象，真正的发布 commit 是 f1e3a2b，故锁定后者"
                 }
               }
             }
@@ -93,26 +82,13 @@
         "fdk-aac": {
           "kind": "git",
           "version": "2.0.3",
-          "homepage": "https://git.woa.com/EST/media/e-ffmpeg/fdk_aac_v2.0.3",
-          "url": "https://git.woa.com/EST/media/e-ffmpeg/fdk_aac_v2.0.3.git",
-          "tag": "",
-          "ref": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
+          "homepage": "https://github.com/mstorsjo/fdk-aac",
+          "url": "https://github.com/mstorsjo/fdk-aac.git",
+          "tag": "v2.0.3",
+          "ref": "v2.0.3",
           "commit": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
-          "internal": true,
           "ffmpeg_flag": "--enable-libfdk-aac",
-          "platform_overrides": {
-            "linux": {
-              "kind": "git",
-              "version": "2.0.3",
-              "url": "https://github.com/mstorsjo/fdk-aac.git",
-              "tag": "v2.0.3",
-              "ref": "v2.0.3",
-              "commit": "716f4394641d53f0d79c9ddac3fa93b03a49f278",
-              "internal": false,
-              "note": "上游 v2.0.3 的 commit 与内网 fdk_aac_v2.0.3 逐字节相同（同为 716f4394），只是换下载地址；Linux 上内网不可达时使用"
-            }
-          },
-          "note": "用内网 fdk_aac_v2.0.3（与 FFmpeg 6.1 的 libfdk-aac wrapper 匹配；上游 v3.0.0 为大版本跨越，暂不升级）"
+          "note": "上游 mstorsjo/fdk-aac v2.0.3（与 FFmpeg 6.1 的 libfdk-aac wrapper 匹配；上游 v3.0.0 为大版本跨越，暂不升级）"
         },
         "openh264": {
           "kind": "archive",
@@ -235,7 +211,7 @@
           "extra_flags": [
             "--enable-ffnvcodec"
           ],
-          "note": "NVIDIA nv-codec-headers：h264_nvenc / hevc_nvenc 编码器。直接用上游 GitHub，锁 tag n12.0.16.1（上游 tag 名带 n 前缀，commit 取剥壳后的 451da996；其 ffnvcodec.pc.in 与内网镜像逐字节一致）。该版本对应 Video Codec SDK 12.0.16，与 ffmpeg 6.1.6 匹配；升到 13.x 会抬高运行期驱动要求。仓库只有 include/ffnvcodec/*.h，无需 sparse。ffmpeg 用 check_pkg_config 找 ffnvcodec（要带版本号的 .pc），故构建时按 .pc.in 生成 ffnvcodec.pc（版本 12.0.16.1）；extra_flags 里的 --enable-ffnvcodec 不能省——--disable-everything 会连外部库 ffnvcodec 一起关掉，nvenc 的依赖就满足不了"
+          "note": "NVIDIA nv-codec-headers：h264_nvenc / hevc_nvenc 编码器。直接用上游 GitHub，锁 tag n12.0.16.1（上游 tag 名带 n 前缀，commit 取剥壳后的 451da996）。该版本对应 Video Codec SDK 12.0.16，与 ffmpeg 6.1.6 匹配；升到 13.x 会抬高运行期驱动要求。仓库只有 include/ffnvcodec/*.h，无需 sparse。ffmpeg 用 check_pkg_config 找 ffnvcodec（要带版本号的 .pc），故构建时按 .pc.in 生成 ffnvcodec.pc（版本 12.0.16.1）；extra_flags 里的 --enable-ffnvcodec 不能省——--disable-everything 会连外部库 ffnvcodec 一起关掉，nvenc 的依赖就满足不了"
         }
       }
     }

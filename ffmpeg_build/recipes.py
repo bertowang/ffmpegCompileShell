@@ -720,7 +720,7 @@ def build_ffmpeg(ctx, abi: str) -> Path:
     lib = C.LIBRARIES["ffmpeg"]
 
     # 个别平台使用专用源码（见锁定文件各条目的 platform_overrides）：
-    # OHOS 用 openharmony-tpc 的 fork；Linux 上内网不可达时用上游镜像
+    # OHOS 用 openharmony-tpc 的 fork；ffmpeg / fdk-aac 默认即上游 GitHub 官方仓库
     source = C.dep_source("ffmpeg", ctx.platform)
     # 允许 --ffmpeg-ref 覆盖仓库分支/标签
     if ctx.ffmpeg_ref and ctx.ffmpeg_ref != source.ref:
